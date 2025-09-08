@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# ============ dependency helpers ============
+# ---------------- deps ----------------
 def _ensure_pkg(pkg_name, spec=None) -> bool:
     try:
         __import__(pkg_name); return True
@@ -28,7 +28,7 @@ def pick_xlsx_engine() -> str:
     if _ensure_pkg("openpyxl",  "openpyxl>=3.1.5"):    return "openpyxl"
     return ""  # neither available
 
-# ============ text/parse helpers ============
+# ---------------- helpers ----------------
 def normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     keep = []
@@ -73,7 +73,7 @@ def split_city_state(value):
     if len(parts) == 2: return parts[0].strip(), parts[1].strip()
     return txt.strip(), ""
 
-# ============ robust loader (CSV/Excel) ============
+# ---------------- loader (CSV/Excel) ----------------
 def load_table(uploaded_file) -> pd.DataFrame:
     raw = uploaded_file.read()
     name = (uploaded_file.name or "").lower()
@@ -86,10 +86,18 @@ def load_table(uploaded_file) -> pd.DataFrame:
         except Exception:
             pass
 
-    # CSV with sniffer + encodings
+    # CSV: read EVERYTHING as string to avoid date auto-parsing (critical for "1/04/2025")
     for enc in ["utf-8", "utf-8-sig", "cp1252", "latin-1", "utf-16", "utf-16-le", "utf-16-be"]:
         try:
-            return pd.read_csv(io.BytesIO(raw), encoding=enc, sep=None, engine="python", on_bad_lines="skip")
+            return pd.read_csv(
+                io.BytesIO(raw),
+                encoding=enc,
+                sep=None,
+                engine="python",
+                on_bad_lines="skip",
+                dtype=str,                 # <---- key change
+                keep_default_na=False,     # keep strings as-is
+            )
         except Exception:
             continue
 
@@ -97,60 +105,56 @@ def load_table(uploaded_file) -> pd.DataFrame:
     _ensure_pkg("openpyxl", "openpyxl>=3.1.5")
     return pd.read_excel(io.BytesIO(raw))
 
-# ============ find RAW ratio column robustly ============
+# ---------------- ratio column handling ----------------
 def find_ratio_col(df: pd.DataFrame) -> str | None:
-    # try exact first
     exact = "# Of Milestones received / # Of Milestones expected"
     if exact in df.columns: return exact
-    # case/space-insensitive fallback
-    def norm(s): return re.sub(r"[^a-z]", "", str(s).lower())
+    def norm(s): return re.sub(r"[^a-z/]", "", str(s).lower())
     want = ["milestones","received","expected"]
     for c in df.columns:
         n = norm(c)
-        if all(w in n for w in want) and "/" in str(c):
-            return c
-    # last resort: any column that looks like "x / y"
-    for c in df.columns:
-        if re.search(r"\d\s*/\s*\d", str(df[c].astype(str).head(20).tolist())):
+        if all(w in n for w in want) and "/" in n:
             return c
     return None
 
-# ============ ratio parser that recovers from dates ============
 def parse_ratio_cell(val):
-    """Return (received, expected) from a cell that might be '1/4', a datetime (1-Apr),
-       or an Excel serial date number."""
+    """
+    Return (received, expected) from values like:
+    - '1/4' -> (1,4)
+    - '1/04/2025' (string date) -> (1,4)  [first two numbers]
+    - Timestamp(2025-04-01 ...) -> (1,4)  [day, month]
+    - Excel serial date -> (day, month)
+    - '0/4' -> (0,4)
+    """
     if val is None or (isinstance(val, float) and np.isnan(val)) or (isinstance(val, str) and not val.strip()):
         return (np.nan, np.nan)
 
-    # Datetime (Excel auto-date like 1/4 -> 1-Apr-[year])
+    # If pandas/Excel gave us a datetime
     if isinstance(val, (pd.Timestamp, dt.datetime, dt.date)):
-        m, d = int(getattr(val, "month")), int(getattr(val, "day"))
-        return (m, d)
+        return (int(getattr(val, "day")), int(getattr(val, "month")))  # day→received, month→expected
 
-    # Numeric: maybe Excel serial date
+    # If it's a number, maybe Excel serial date
     if isinstance(val, (int, float)) and not isinstance(val, bool):
-        # Excel serial dates are typically > 59; convert then take month/day
-        if val > 59 and val < 60000:
+        if 59 < float(val) < 60000:  # plausible Excel serial
             base = dt.datetime(1899, 12, 30)
             as_dt = base + dt.timedelta(days=float(val))
-            return (as_dt.month, as_dt.day)
-        # otherwise just treat as received with unknown expected
+            return (as_dt.day, as_dt.month)
         try:
             return (int(val), np.nan)
         except Exception:
             return (np.nan, np.nan)
 
-    # String cases
     s = str(val).strip()
-    # pure ratio like "1/4" or " 1 / 4 "
+
+    # Plain ratio 'a/b'
     m = re.match(r"^\s*(\d+)\s*/\s*(\d+)\s*$", s)
     if m:
         return (int(m.group(1)), int(m.group(2)))
 
-    # loose fallback: grab first two integers in order
-    m2 = re.findall(r"(-?\d+)", s)
-    if len(m2) >= 2:
-        return (int(m2[0]), int(m2[1]))
+    # Date-like 'd/m/yyyy' or 'm/d/yyyy': take first two integers as received/expected
+    nums = re.findall(r"(\d+)", s)
+    if len(nums) >= 2:
+        return (int(nums[0]), int(nums[1]))
 
     return (np.nan, np.nan)
 
@@ -160,7 +164,7 @@ def parse_received_expected(series_ratio: pd.Series):
     exp = pd.to_numeric(rec_exp.apply(lambda t: t[1]), errors="coerce")
     return rec, exp
 
-# ============ RAW → Data mapping ============
+# ---------------- RAW → Data mapping ----------------
 DATA_COLUMNS_ORDER = [
     "Carrier Name","Bill of Lading","Tracked","Pickup Name","Pickup City State","Pickup Country",
     "Dropoff Name","Dropoff City State","Dropoff Country","Final Status Reason",
@@ -173,7 +177,7 @@ DATA_COLUMNS_ORDER = [
 
 def build_data_from_raw(df_raw: pd.DataFrame) -> pd.DataFrame:
     df = normalize_headers(df_raw); n = len(df)
-    def col(name): return df.get(name, pd.Series([np.nan]*n))
+    def col(name): return df.get(name, pd.Series([np.nan]*n, dtype=object))
 
     ratio_col = find_ratio_col(df)
     if ratio_col is not None:
@@ -210,15 +214,14 @@ def build_data_from_raw(df_raw: pd.DataFrame) -> pd.DataFrame:
         "Latency Updates Passed": updates_passed,
         "Shipment Latency Percentage": ship_latency_pct,
         "Average Latency (min)": pd.to_numeric(col("Average Latency (min)"), errors="coerce"),
-    })
+    }, columns=DATA_COLUMNS_ORDER)
 
-    return data[DATA_COLUMNS_ORDER]
+    return data
 
-# ============ V column + Summary builders ============
+# ---------------- V + Summary ----------------
 def compute_in_transit_time_row(row):
     tracked = row.get("Tracked", np.nan)
     nb_recv = as_int_or_nan(row.get("Nb Milestones Received", np.nan))
-    # Untracked if tracked is FALSE-like OR received is 0/empty
     if is_false_like(tracked) or (pd.isna(nb_recv) or nb_recv == 0):
         return "Untracked"
 
@@ -284,7 +287,7 @@ def build_summary(df_data):
 
     return small, main_with_total
 
-# ============ write one report (XLSX if possible; else ZIP CSV) ============
+# ---------------- build one report ----------------
 def build_report_blob(df_data, small_summary, main_summary):
     engine = pick_xlsx_engine()
     if engine:
@@ -292,7 +295,7 @@ def build_report_blob(df_data, small_summary, main_summary):
         with pd.ExcelWriter(buf, engine=engine) as writer:
             df_data.to_excel(writer, sheet_name="Data", index=False)
             small_summary.to_excel(writer, sheet_name="Summary", index=False, startrow=0)
-            main_summary.to_excel(writer, sheet_name="Summary", index=False, startrow=6)  # row 7 in Excel
+            main_summary.to_excel(writer, sheet_name="Summary", index=False, startrow=6)  # row 7
         buf.seek(0)
         return buf.getvalue(), "xlsx", "FTL_Data_and_Summary.xlsx"
 
@@ -304,7 +307,7 @@ def build_report_blob(df_data, small_summary, main_summary):
     zbuf.seek(0)
     return zbuf.getvalue(), "zip", "FTL_Report.zip"
 
-# ============ Streamlit UI ============
+# ---------------- Streamlit UI ----------------
 st.set_page_config(page_title="FTL In-Transit Builder", page_icon="🚚", layout="wide")
 st.title("FTL In-Transit Time Processor (RAW → Data → Summary)")
 
@@ -317,13 +320,10 @@ if uploaded:
 
         data_df = build_data_from_raw(raw_df)
 
-        # Column V: In-Transit Time
         data_df["In-Transit Time"] = data_df.apply(compute_in_transit_time_row, axis=1)
 
-        # Summary sheets
         small_df, main_df = build_summary(data_df)
 
-        # Build single report
         blob, ext, fname = build_report_blob(data_df, small_df, main_df)
 
         st.success("Processed! Download your report below.")
@@ -342,7 +342,6 @@ if uploaded:
         with st.expander("Preview: Summary (main; only numeric V)"):
             st.dataframe(main_df.head(50), use_container_width=True)
 
-        # quick sanity line
         st.caption(
             f"Rows: {len(data_df):,} | numeric V: {(pd.to_numeric(data_df['In-Transit Time'], errors='coerce').notna()).sum():,} "
             f"| Untracked: {(data_df['In-Transit Time']=='Untracked').sum():,} "
