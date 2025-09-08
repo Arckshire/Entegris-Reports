@@ -3,13 +3,19 @@ import math
 import re
 import sys
 import subprocess
-import zipfile
-import datetime as dt
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-# ---------------- deps ----------------
+# -----------------------------
+# App meta
+# -----------------------------
+st.set_page_config(page_title="Entegris Reports", page_icon="📦", layout="wide")
+st.title("Entegris Reports — Summary Builder (Tracked / Missed / Untracked)")
+
+# -----------------------------
+# Dependency helper for Excel
+# -----------------------------
 def _ensure_pkg(pkg_name, spec=None) -> bool:
     try:
         __import__(pkg_name); return True
@@ -28,15 +34,19 @@ def pick_xlsx_engine() -> str:
     if _ensure_pkg("openpyxl",  "openpyxl>=3.1.5"):    return "openpyxl"
     return ""  # neither available
 
-# ---------------- helpers ----------------
+# -----------------------------
+# Parsing helpers
+# -----------------------------
 def normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+    # Drop completely unnamed columns
     keep = []
     for c in df.columns:
         s = str(c).strip()
         if s and not s.lower().startswith("unnamed"):
             keep.append(c)
     df = df.loc[:, keep]
+    # Collapse whitespace in headers
     df.columns = [re.sub(r"\s+", " ", str(c).strip()) for c in df.columns]
     return df
 
@@ -45,310 +55,253 @@ def is_missing_like(x):
     if isinstance(x, str) and x.strip().lower() in {"", "na", "n/a", "null", "none"}: return True
     return False
 
-def parse_timestamp(s):
-    if pd.isna(s): return pd.NaT
-    return pd.to_datetime(s, utc=True, errors="coerce")
-
-def as_int_or_nan(x):
-    if is_missing_like(x): return np.nan
-    try: return int(float(str(x).strip()))
-    except Exception: return np.nan
+def is_true_like(v):
+    if isinstance(v, bool): return v is True
+    if is_missing_like(v):  return False
+    if isinstance(v, (int, float)): return int(v) == 1
+    if isinstance(v, str):
+        s = v.strip().lower()
+        return s in {"true", "yes", "y", "1"}
+    return False
 
 def is_false_like(v):
     if isinstance(v, bool): return v is False
     if is_missing_like(v):  return False
     if isinstance(v, (int, float)): return int(v) == 0
-    if isinstance(v, str):  return v.strip().lower() in {"false", "no", "0"}
+    if isinstance(v, str):
+        s = v.strip().lower()
+        return s in {"false", "no", "n", "0"}
     return False
+
+def parse_timestamp_utc(s):
+    if pd.isna(s): return pd.NaT
+    return pd.to_datetime(s, utc=True, errors="coerce")
 
 def round_half_up_days(x):
     if pd.isna(x): return np.nan
-    return math.floor(x + 0.5)
+    return math.floor(x + 0.5)  # e.g., 3.5->4, 3.4->3
 
-def split_city_state(value):
-    if is_missing_like(value): return "", ""
-    txt = str(value)
-    parts = re.split(r"\s*-\s*", txt, maxsplit=1)
-    if len(parts) == 1: parts = txt.split("-", 1)
-    if len(parts) == 2: return parts[0].strip(), parts[1].strip()
-    return txt.strip(), ""
+def split_city_state(text: str):
+    """Preferred: split on first '-' (city - state). Else try last 2-letter uppercase token as state.
+       Returns (city, state)."""
+    if is_missing_like(text): return "", ""
+    s = str(text).strip()
 
-# ---------------- loader (CSV/Excel) ----------------
+    # Case 1: explicit dash
+    parts = re.split(r"\s*-\s*", s, maxsplit=1)
+    if len(parts) == 2:
+        return parts[0].strip(), parts[1].strip()
+
+    # Case 2: ends with 2-letter state
+    m = re.match(r"^(.*?)[\s,]+([A-Z]{2})$", s)
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+
+    # Fallback: everything is city
+    return s, ""
+
+# -----------------------------
+# Loader (CSV or Excel)
+# -----------------------------
 def load_table(uploaded_file) -> pd.DataFrame:
-    raw = uploaded_file.read()
+    raw_bytes = uploaded_file.read()
     name = (uploaded_file.name or "").lower()
 
-    # Excel by extension or ZIP signature
-    if name.endswith((".xlsx", ".xls")) or raw[:2] == b"PK":
+    # Excel by extension or zip signature
+    if name.endswith((".xlsx", ".xls")) or raw_bytes[:2] == b"PK":
         try:
             _ensure_pkg("openpyxl", "openpyxl>=3.1.5")
-            return pd.read_excel(io.BytesIO(raw))
+            return pd.read_excel(io.BytesIO(raw_bytes))
         except Exception:
             pass
 
-    # CSV: read EVERYTHING as string to avoid date auto-parsing (critical for "1/04/2025")
+    # CSV: read as text to avoid weird type coercions
     for enc in ["utf-8", "utf-8-sig", "cp1252", "latin-1", "utf-16", "utf-16-le", "utf-16-be"]:
         try:
             return pd.read_csv(
-                io.BytesIO(raw),
+                io.BytesIO(raw_bytes),
                 encoding=enc,
                 sep=None,
                 engine="python",
                 on_bad_lines="skip",
-                dtype=str,                 # <---- key change
-                keep_default_na=False,     # keep strings as-is
+                dtype=str,              # keep everything as text; we’ll parse what we need
+                keep_default_na=False,
             )
         except Exception:
             continue
 
     # Last resort try Excel again
     _ensure_pkg("openpyxl", "openpyxl>=3.1.5")
-    return pd.read_excel(io.BytesIO(raw))
+    return pd.read_excel(io.BytesIO(raw_bytes))
 
-# ---------------- ratio column handling ----------------
-def find_ratio_col(df: pd.DataFrame) -> str | None:
-    exact = "# Of Milestones received / # Of Milestones expected"
-    if exact in df.columns: return exact
-    def norm(s): return re.sub(r"[^a-z/]", "", str(s).lower())
-    want = ["milestones","received","expected"]
-    for c in df.columns:
-        n = norm(c)
-        if all(w in n for w in want) and "/" in n:
-            return c
-    return None
+# -----------------------------
+# Core builder: Summary only
+# -----------------------------
+RAW_MAP = {
+    "bol": "Bill of Lading",                               # G
+    "tracked": "Tracked",                                   # I
+    "p_name": "Pickup Name",                                # N
+    "p_city_state": "Pickup City State",                    # O
+    "p_country": "Pickup Country",                          # P
+    "d_name": "Final Destination Name",                     # S
+    "d_city_state": "Final Destination City State",         # T
+    "d_country": "Final Destination Country",               # U
+    "pickup_departure_utc": "Pickup Departure Milestone (UTC)",               # AA
+    "dropoff_arrival_utc": "Final Destination Arrival Milestone (UTC)",       # AB
+}
 
-def parse_ratio_cell(val):
-    """
-    Return (received, expected) from values like:
-    - '1/4' -> (1,4)
-    - '1/04/2025' (string date) -> (1,4)  [first two numbers]
-    - Timestamp(2025-04-01 ...) -> (1,4)  [day, month]
-    - Excel serial date -> (day, month)
-    - '0/4' -> (0,4)
-    """
-    if val is None or (isinstance(val, float) and np.isnan(val)) or (isinstance(val, str) and not val.strip()):
-        return (np.nan, np.nan)
+def build_summary_tables(df_raw: pd.DataFrame):
+    df = normalize_headers(df_raw).copy()
 
-    # If pandas/Excel gave us a datetime
-    if isinstance(val, (pd.Timestamp, dt.datetime, dt.date)):
-        return (int(getattr(val, "day")), int(getattr(val, "month")))  # day→received, month→expected
+    # Keep only columns we care about; create if absent to avoid crashes
+    for key, col in RAW_MAP.items():
+        if col not in df.columns:
+            df[col] = np.nan
 
-    # If it's a number, maybe Excel serial date
-    if isinstance(val, (int, float)) and not isinstance(val, bool):
-        if 59 < float(val) < 60000:  # plausible Excel serial
-            base = dt.datetime(1899, 12, 30)
-            as_dt = base + dt.timedelta(days=float(val))
-            return (as_dt.day, as_dt.month)
-        try:
-            return (int(val), np.nan)
-        except Exception:
-            return (np.nan, np.nan)
+    # Convenience Series
+    bol   = df[RAW_MAP["bol"]].astype(str).str.strip()
+    trk   = df[RAW_MAP["tracked"]]
+    pnm   = df[RAW_MAP["p_name"]].astype(str).str.strip()
+    pcst  = df[RAW_MAP["p_city_state"]].astype(str).str.strip()
+    pctr  = df[RAW_MAP["p_country"]].astype(str).str.strip()
+    dnm   = df[RAW_MAP["d_name"]].astype(str).str.strip()
+    dcst  = df[RAW_MAP["d_city_state"]].astype(str).str.strip()
+    dctr  = df[RAW_MAP["d_country"]].astype(str).str.strip()
+    dep   = df[RAW_MAP["pickup_departure_utc"]]
+    arr   = df[RAW_MAP["dropoff_arrival_utc"]]
 
-    s = str(val).strip()
+    # Parse timestamps
+    dep_ts = dep.apply(parse_timestamp_utc)
+    arr_ts = arr.apply(parse_timestamp_utc)
 
-    # Plain ratio 'a/b'
-    m = re.match(r"^\s*(\d+)\s*/\s*(\d+)\s*$", s)
-    if m:
-        return (int(m.group(1)), int(m.group(2)))
+    # Compute transit days (raw float)
+    delta_days = (arr_ts - dep_ts).dt.total_seconds() / (24 * 3600)
+    # Valid transit when strictly > 0
+    valid_transit = delta_days > 0
+    # Rounded “Average of In-Transit Time”
+    in_transit_days = delta_days.apply(lambda x: int(round_half_up_days(x)) if pd.notna(x) else np.nan)
 
-    # Date-like 'd/m/yyyy' or 'm/d/yyyy': take first two integers as received/expected
-    nums = re.findall(r"(\d+)", s)
-    if len(nums) >= 2:
-        return (int(nums[0]), int(nums[1]))
+    # Categories (mutually exclusive)
+    is_untracked = trk.apply(is_false_like)
+    is_tracked_true = trk.apply(is_true_like)
 
-    return (np.nan, np.nan)
+    is_missing = (~is_untracked) & is_tracked_true & (~valid_transit.fillna(False))
+    is_tracked_good = (~is_untracked) & is_tracked_true & valid_transit.fillna(False)
 
-def parse_received_expected(series_ratio: pd.Series):
-    rec_exp = series_ratio.apply(parse_ratio_cell)
-    rec = pd.to_numeric(rec_exp.apply(lambda t: t[0]), errors="coerce")
-    exp = pd.to_numeric(rec_exp.apply(lambda t: t[1]), errors="coerce")
-    return rec, exp
+    # Small summary counts
+    cnt_untracked = int(is_untracked.sum())
+    cnt_missing   = int(is_missing.sum())
+    cnt_tracked   = int(is_tracked_good.sum())
+    grand_total   = cnt_untracked + cnt_missing + cnt_tracked
 
-# ---------------- RAW → Data mapping ----------------
-DATA_COLUMNS_ORDER = [
-    "Carrier Name","Bill of Lading","Tracked","Pickup Name","Pickup City State","Pickup Country",
-    "Dropoff Name","Dropoff City State","Dropoff Country","Final Status Reason",
-    "Pickup Arrival Utc Timestamp Raw","Pickup Departure Utc Timestamp Raw",
-    "Dropoff Arrival Utc Timestamp Raw","Dropoff Departure Utc Timestamp Raw",
-    "Nb Milestones Expected","Nb Milestones Received","Milestones Achieved Percentage",
-    "Latency Updates Received","Latency Updates Passed","Shipment Latency Percentage",
-    "Average Latency (min)",
-]
+    # Overall average of tracked shipments’ in-transit time
+    tracked_days = in_transit_days.where(is_tracked_good)
+    avg_tracked = float(pd.to_numeric(tracked_days, errors="coerce").dropna().mean()) if cnt_tracked > 0 else ""
 
-def build_data_from_raw(df_raw: pd.DataFrame) -> pd.DataFrame:
-    df = normalize_headers(df_raw); n = len(df)
-    def col(name): return df.get(name, pd.Series([np.nan]*n, dtype=object))
-
-    ratio_col = find_ratio_col(df)
-    if ratio_col is not None:
-        rec, exp = parse_received_expected(df[ratio_col])
-    else:
-        rec = pd.Series([np.nan]*n); exp = pd.Series([np.nan]*n)
-
-    updates_total  = pd.to_numeric(col("# Updates Received"), errors="coerce")
-    updates_passed = pd.to_numeric(col("# Updates Received < 10 mins"), errors="coerce")
-
-    with np.errstate(divide="ignore", invalid="ignore"):
-        milestones_pct   = (rec / exp) * 100.0
-        ship_latency_pct = (updates_passed / updates_total) * 100.0
-
-    data = pd.DataFrame({
-        "Carrier Name": col("Carrier Name"),
-        "Bill of Lading": col("Bill of Lading"),
-        "Tracked": col("Tracked"),
-        "Pickup Name": col("Pickup Name"),
-        "Pickup City State": col("Pickup City State"),
-        "Pickup Country": col("Pickup Country"),
-        "Dropoff Name": col("Final Destination Name"),
-        "Dropoff City State": col("Final Destination City State"),
-        "Dropoff Country": col("Final Destination Country"),
-        "Final Status Reason": col("Final Status Reason"),
-        "Pickup Arrival Utc Timestamp Raw": col("Pickup Arrival Milestone (UTC)"),
-        "Pickup Departure Utc Timestamp Raw": col("Pickup Departure Milestone (UTC)"),
-        "Dropoff Arrival Utc Timestamp Raw": col("Final Destination Arrival Milestone (UTC)"),
-        "Dropoff Departure Utc Timestamp Raw": col("Final Destination Departure Milestone (UTC)"),
-        "Nb Milestones Expected": exp,
-        "Nb Milestones Received": rec,
-        "Milestones Achieved Percentage": milestones_pct,
-        "Latency Updates Received": updates_total,
-        "Latency Updates Passed": updates_passed,
-        "Shipment Latency Percentage": ship_latency_pct,
-        "Average Latency (min)": pd.to_numeric(col("Average Latency (min)"), errors="coerce"),
-    }, columns=DATA_COLUMNS_ORDER)
-
-    return data
-
-# ---------------- V + Summary ----------------
-def compute_in_transit_time_row(row):
-    tracked = row.get("Tracked", np.nan)
-    nb_recv = as_int_or_nan(row.get("Nb Milestones Received", np.nan))
-    if is_false_like(tracked) or (pd.isna(nb_recv) or nb_recv == 0):
-        return "Untracked"
-
-    pick_dep = parse_timestamp(row.get("Pickup Departure Utc Timestamp Raw"))
-    drop_arr = parse_timestamp(row.get("Dropoff Arrival Utc Timestamp Raw"))
-    if pd.isna(pick_dep) or pd.isna(drop_arr):
-        return "Missing Milestone"
-
-    delta_days = (drop_arr - pick_dep).total_seconds() / (24*3600)
-    if delta_days <= 0:
-        return "Missing Milestone"
-
-    return int(round_half_up_days(delta_days))
-
-def build_summary(df_data):
-    v = df_data["In-Transit Time"]
-    is_num = pd.to_numeric(v, errors="coerce").notna()
-
-    count_tracked   = int(is_num.sum())
-    count_missing   = int((v == "Missing Milestone").sum())
-    count_untracked = int((v == "Untracked").sum())
-    grand_total     = count_tracked + count_missing + count_untracked
-
-    numeric_vals = pd.to_numeric(v, errors="coerce")
-    avg_days_all = float(numeric_vals.dropna().mean()) if numeric_vals.notna().any() else ""
-
+    # Build small table (rows 1–5 conceptually)
     small = pd.DataFrame({
-        "Label": ["Tracked","Missed Milestone","Untracked","Grand Total"],
-        "Shipment Count": [count_tracked, count_missing, count_untracked, grand_total],
-        "": ["","","",""],
-        "Average of In-Transit Time": ["","","", avg_days_all],
-        "Time taken from Departure to Arrival": ["","","",""],
+        "Label": ["Tracked", "Missed Milestone", "Untracked", "Grand Total"],
+        "Shipment Count": [cnt_tracked, cnt_missing, cnt_untracked, grand_total],
+        "": ["", "", "", ""],  # blank col
+        "Average of In-Transit Time": ["", "", "", avg_tracked],
+        "Time taken from Departure to Arrival": ["", "", "", ""],
     })
 
-    df_num = df_data[is_num].copy()
-    if len(df_num) > 0:
-        pick_city, pick_state = zip(*df_num["Pickup City State"].map(split_city_state))
-        drop_city, drop_state = zip(*df_num["Dropoff City State"].map(split_city_state))
-    else:
-        pick_city, pick_state, drop_city, drop_state = [], [], [], []
+    # Main table: only tracked_good rows
+    rows = df[is_tracked_good].copy()
+    # City/state split
+    p_city_state = rows[RAW_MAP["p_city_state"]].astype(str)
+    d_city_state = rows[RAW_MAP["d_city_state"]].astype(str)
+    p_city, p_state = zip(*p_city_state.map(split_city_state)) if len(rows) else ([], [])
+    d_city, d_state = zip(*d_city_state.map(split_city_state)) if len(rows) else ([], [])
 
     main = pd.DataFrame({
-        "Bill of Lading": df_num["Bill of Lading"].astype(str),
-        "Pickup Name": df_num["Pickup Name"].astype(str),
-        "Pickup City": list(pick_city),
-        "Pickup State": list(pick_state),
-        "Pickup Country": df_num["Pickup Country"].astype(str),
-        "Dropoff Name": df_num["Dropoff Name"].astype(str),
-        "Dropoff City": list(drop_city),
-        "Dropoff State": list(drop_state),
-        "Dropoff Country": df_num["Dropoff Country"].astype(str),
-        "Average of In-Transit Time": pd.to_numeric(df_num["In-Transit Time"], errors="coerce").astype("Int64"),
+        "Bill of Lading": rows[RAW_MAP["bol"]].astype(str).str.strip(),
+        "Pickup Name": rows[RAW_MAP["p_name"]].astype(str).str.strip(),
+        "Pickup City": list(p_city),
+        "Pickup State": list(p_state),
+        "Pickup Country": rows[RAW_MAP["p_country"]].astype(str).str.strip(),
+        "Dropoff Name": rows[RAW_MAP["d_name"]].astype(str).str.strip(),
+        "Dropoff City": list(d_city),
+        "Dropoff State": list(d_state),
+        "Dropoff Country": rows[RAW_MAP["d_country"]].astype(str).str.strip(),
+        "Average of In-Transit Time": tracked_days[is_tracked_good].astype("Int64"),
     })
 
-    if len(main) > 0:
+    # Append Grand Total average row
+    if cnt_tracked > 0:
         javg = float(pd.to_numeric(main["Average of In-Transit Time"], errors="coerce").dropna().mean())
     else:
         javg = ""
     total_row = {col: "" for col in main.columns}
     total_row["Bill of Lading"] = "Grand Total"
     total_row["Average of In-Transit Time"] = javg
-    main_with_total = pd.concat([main, pd.DataFrame([total_row])], ignore_index=True)
+    main = pd.concat([main, pd.DataFrame([total_row])], ignore_index=True)
 
-    return small, main_with_total
+    return small, main
 
-# ---------------- build one report ----------------
-def build_report_blob(df_data, small_summary, main_summary):
+# -----------------------------
+# Excel writer (single sheet, no styling)
+# -----------------------------
+def build_summary_excel(small_df: pd.DataFrame, main_df: pd.DataFrame) -> bytes | None:
     engine = pick_xlsx_engine()
-    if engine:
-        buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine=engine) as writer:
-            df_data.to_excel(writer, sheet_name="Data", index=False)
-            small_summary.to_excel(writer, sheet_name="Summary", index=False, startrow=0)
-            main_summary.to_excel(writer, sheet_name="Summary", index=False, startrow=6)  # row 7
-        buf.seek(0)
-        return buf.getvalue(), "xlsx", "FTL_Data_and_Summary.xlsx"
+    if not engine:
+        return None
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine=engine) as writer:
+        # Put small table at rows 1–5 (startrow=0)
+        small_df.to_excel(writer, sheet_name="Summary", index=False, startrow=0)
+        # Leave row 6 blank by starting main at row index 6 (Excel row 7)
+        main_df.to_excel(writer, sheet_name="Summary", index=False, startrow=6)
+    out.seek(0)
+    return out.getvalue()
 
-    zbuf = io.BytesIO()
-    with zipfile.ZipFile(zbuf, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        z.writestr("Data.csv", df_data.to_csv(index=False))
-        z.writestr("Summary_small.csv", small_summary.to_csv(index=False))
-        z.writestr("Summary_main.csv", main_summary.to_csv(index=False))
-    zbuf.seek(0)
-    return zbuf.getvalue(), "zip", "FTL_Report.zip"
-
-# ---------------- Streamlit UI ----------------
-st.set_page_config(page_title="FTL In-Transit Builder", page_icon="🚚", layout="wide")
-st.title("FTL In-Transit Time Processor (RAW → Data → Summary)")
-
-uploaded = st.file_uploader("Upload RAW CSV or Excel", type=["csv", "xlsx", "xls"])
+# -----------------------------
+# UI
+# -----------------------------
+uploaded = st.file_uploader("Upload RAW file (CSV or Excel)", type=["csv", "xlsx", "xls"], accept_multiple_files=False)
 
 if uploaded:
     try:
-        raw_df  = load_table(uploaded)
-        raw_df  = normalize_headers(raw_df)
+        df_raw = load_table(uploaded)
+        small_df, main_df = build_summary_tables(df_raw)
 
-        data_df = build_data_from_raw(raw_df)
+        st.success("Summary built successfully.")
 
-        data_df["In-Transit Time"] = data_df.apply(compute_in_transit_time_row, axis=1)
-
-        small_df, main_df = build_summary(data_df)
-
-        blob, ext, fname = build_report_blob(data_df, small_df, main_df)
-
-        st.success("Processed! Download your report below.")
-        st.download_button(
-            "⬇️ Download Report" + (" (Excel .xlsx)" if ext=="xlsx" else " (ZIP: CSV files)"),
-            data=blob,
-            file_name=fname,
-            mime=("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" if ext=="xlsx" else "application/zip"),
-            use_container_width=True
-        )
-
-        with st.expander("Preview: Data (first 50 rows)"):
-            st.dataframe(data_df.head(50), use_container_width=True)
-        with st.expander("Preview: Summary (small 1–5 rows)"):
+        # Previews
+        with st.expander("Preview — Small table (rows 1–5)"):
             st.dataframe(small_df, use_container_width=True)
-        with st.expander("Preview: Summary (main; only numeric V)"):
+        with st.expander("Preview — Main table (row 7 onward)"):
             st.dataframe(main_df.head(50), use_container_width=True)
 
-        st.caption(
-            f"Rows: {len(data_df):,} | numeric V: {(pd.to_numeric(data_df['In-Transit Time'], errors='coerce').notna()).sum():,} "
-            f"| Untracked: {(data_df['In-Transit Time']=='Untracked').sum():,} "
-            f"| Missing: {(data_df['In-Transit Time']=='Missing Milestone').sum():,}"
-        )
+        # CSV downloads
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.download_button("⬇️ Download Small (CSV)", small_df.to_csv(index=False).encode("utf-8"),
+                               "Summary_small.csv", "text/csv", use_container_width=True)
+        with c2:
+            st.download_button("⬇️ Download Main (CSV)", main_df.to_csv(index=False).encode("utf-8"),
+                               "Summary_main.csv", "text/csv", use_container_width=True)
+
+        # Excel download (single sheet "Summary")
+        excel_blob = build_summary_excel(small_df, main_df)
+        with c3:
+            if excel_blob is not None:
+                st.download_button("⬇️ Download Summary (Excel)",
+                                   data=excel_blob,
+                                   file_name="Summary.xlsx",
+                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                   use_container_width=True)
+            else:
+                st.info("Excel engine unavailable; use the CSV downloads (or add openpyxl/xlsxwriter).")
+
+        # Quick sanity footer
+        st.caption(f"Counts — Tracked: {int(small_df.loc[0, 'Shipment Count'])}, "
+                   f"Missed: {int(small_df.loc[1, 'Shipment Count'])}, "
+                   f"Untracked: {int(small_df.loc[2, 'Shipment Count'])}, "
+                   f"Total: {int(small_df.loc[3, 'Shipment Count'])}")
 
     except Exception as e:
         st.error(f"Could not process this file. Details: {e}")
 else:
-    st.info("Upload your raw file to begin.")
+    st.info("Upload your CSV/XLSX to generate the Summary.")
