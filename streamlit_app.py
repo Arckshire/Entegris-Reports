@@ -39,14 +39,12 @@ def pick_xlsx_engine() -> str:
 # -----------------------------
 def normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    # Drop completely unnamed columns
     keep = []
     for c in df.columns:
         s = str(c).strip()
         if s and not s.lower().startswith("unnamed"):
             keep.append(c)
     df = df.loc[:, keep]
-    # Collapse whitespace in headers
     df.columns = [re.sub(r"\s+", " ", str(c).strip()) for c in df.columns]
     return df
 
@@ -153,20 +151,13 @@ RAW_MAP = {
 def build_summary_tables(df_raw: pd.DataFrame):
     df = normalize_headers(df_raw).copy()
 
-    # Keep only columns we care about; create if absent to avoid crashes
+    # Ensure needed columns exist
     for key, col in RAW_MAP.items():
         if col not in df.columns:
             df[col] = np.nan
 
     # Convenience Series
-    bol   = df[RAW_MAP["bol"]].astype(str).str.strip()
     trk   = df[RAW_MAP["tracked"]]
-    pnm   = df[RAW_MAP["p_name"]].astype(str).str.strip()
-    pcst  = df[RAW_MAP["p_city_state"]].astype(str).str.strip()
-    pctr  = df[RAW_MAP["p_country"]].astype(str).str.strip()
-    dnm   = df[RAW_MAP["d_name"]].astype(str).str.strip()
-    dcst  = df[RAW_MAP["d_city_state"]].astype(str).str.strip()
-    dctr  = df[RAW_MAP["d_country"]].astype(str).str.strip()
     dep   = df[RAW_MAP["pickup_departure_utc"]]
     arr   = df[RAW_MAP["dropoff_arrival_utc"]]
 
@@ -176,29 +167,26 @@ def build_summary_tables(df_raw: pd.DataFrame):
 
     # Compute transit days (raw float)
     delta_days = (arr_ts - dep_ts).dt.total_seconds() / (24 * 3600)
-    # Valid transit when strictly > 0
     valid_transit = delta_days > 0
-    # Rounded “Average of In-Transit Time”
+    # Rounded days
     in_transit_days = delta_days.apply(lambda x: int(round_half_up_days(x)) if pd.notna(x) else np.nan)
 
     # Categories (mutually exclusive)
-    is_untracked = trk.apply(is_false_like)
-    is_tracked_true = trk.apply(is_true_like)
+    is_untracked     = trk.apply(is_false_like)
+    is_tracked_true  = trk.apply(is_true_like)
+    is_missing       = (~is_untracked) & is_tracked_true & (~valid_transit.fillna(False))
+    is_tracked_good  = (~is_untracked) & is_tracked_true & valid_transit.fillna(False)
 
-    is_missing = (~is_untracked) & is_tracked_true & (~valid_transit.fillna(False))
-    is_tracked_good = (~is_untracked) & is_tracked_true & valid_transit.fillna(False)
-
-    # Small summary counts
+    # Small summary counts & average
     cnt_untracked = int(is_untracked.sum())
     cnt_missing   = int(is_missing.sum())
     cnt_tracked   = int(is_tracked_good.sum())
     grand_total   = cnt_untracked + cnt_missing + cnt_tracked
 
-    # Overall average of tracked shipments’ in-transit time
     tracked_days = in_transit_days.where(is_tracked_good)
     avg_tracked = float(pd.to_numeric(tracked_days, errors="coerce").dropna().mean()) if cnt_tracked > 0 else ""
 
-    # Build small table (rows 1–5 conceptually)
+    # Small table (rows 1–5)
     small = pd.DataFrame({
         "Label": ["Tracked", "Missed Milestone", "Untracked", "Grand Total"],
         "Shipment Count": [cnt_tracked, cnt_missing, cnt_untracked, grand_total],
@@ -207,13 +195,16 @@ def build_summary_tables(df_raw: pd.DataFrame):
         "Time taken from Departure to Arrival": ["", "", "", ""],
     })
 
-    # Main table: only tracked_good rows
+    # Main table (only rows with numeric in-transit days = tracked_good)
     rows = df[is_tracked_good].copy()
+
     # City/state split
-    p_city_state = rows[RAW_MAP["p_city_state"]].astype(str)
-    d_city_state = rows[RAW_MAP["d_city_state"]].astype(str)
-    p_city, p_state = zip(*p_city_state.map(split_city_state)) if len(rows) else ([], [])
-    d_city, d_state = zip(*d_city_state.map(split_city_state)) if len(rows) else ([], [])
+    def cs(series): return series.astype(str)
+    p_city, p_state = ([], [])
+    d_city, d_state = ([], [])
+    if len(rows):
+        p_city, p_state = zip(*cs(rows[RAW_MAP["p_city_state"]]).map(split_city_state))
+        d_city, d_state = zip(*cs(rows[RAW_MAP["d_city_state"]]).map(split_city_state))
 
     main = pd.DataFrame({
         "Bill of Lading": rows[RAW_MAP["bol"]].astype(str).str.strip(),
@@ -229,7 +220,7 @@ def build_summary_tables(df_raw: pd.DataFrame):
     })
 
     # Append Grand Total average row
-    if cnt_tracked > 0:
+    if len(main) > 0:
         javg = float(pd.to_numeric(main["Average of In-Transit Time"], errors="coerce").dropna().mean())
     else:
         javg = ""
@@ -243,7 +234,7 @@ def build_summary_tables(df_raw: pd.DataFrame):
 # -----------------------------
 # Excel writer (single sheet, no styling)
 # -----------------------------
-def build_summary_excel(small_df: pd.DataFrame, main_df: pd.DataFrame) -> bytes | None:
+def build_summary_excel(small_df: pd.DataFrame, main_df: pd.DataFrame, mode_name: str) -> bytes | None:
     engine = pick_xlsx_engine()
     if not engine:
         return None
@@ -253,13 +244,34 @@ def build_summary_excel(small_df: pd.DataFrame, main_df: pd.DataFrame) -> bytes 
         small_df.to_excel(writer, sheet_name="Summary", index=False, startrow=0)
         # Leave row 6 blank by starting main at row index 6 (Excel row 7)
         main_df.to_excel(writer, sheet_name="Summary", index=False, startrow=6)
+        # (Optional) annotate mode in a separate sheet
+        pd.DataFrame({"Mode":[mode_name]}).to_excel(writer, sheet_name="Meta", index=False)
     out.seek(0)
     return out.getvalue()
 
 # -----------------------------
+# Single CSV builder (both tables in one file)
+# -----------------------------
+def build_summary_single_csv(small_df: pd.DataFrame, main_df: pd.DataFrame) -> bytes:
+    """
+    Creates one CSV with:
+      - small table header + rows
+      - one blank line (row 6)
+      - main table header + rows (from row 7)
+    Note: CSVs can have multiple header-like lines; Excel will display both sections fine.
+    """
+    buf = io.StringIO()
+    small_df.to_csv(buf, index=False)
+    buf.write("\n")  # blank row 6
+    main_df.to_csv(buf, index=False)
+    return buf.getvalue().encode("utf-8")
+
+# -----------------------------
 # UI
 # -----------------------------
+mode = st.selectbox("Mode", options=["FTL", "LTL", "Ocean", "Air", "Parcel"], index=0, help="Currently uses the same FTL logic for all modes. Share mapping later to customize.")
 uploaded = st.file_uploader("Upload RAW file (CSV or Excel)", type=["csv", "xlsx", "xls"], accept_multiple_files=False)
+st.caption(f"Selected mode: **{mode}** — using FTL-style logic until you provide mode-specific columns.")
 
 if uploaded:
     try:
@@ -274,32 +286,46 @@ if uploaded:
         with st.expander("Preview — Main table (row 7 onward)"):
             st.dataframe(main_df.head(50), use_container_width=True)
 
-        # CSV downloads
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.download_button("⬇️ Download Small (CSV)", small_df.to_csv(index=False).encode("utf-8"),
-                               "Summary_small.csv", "text/csv", use_container_width=True)
-        with c2:
-            st.download_button("⬇️ Download Main (CSV)", main_df.to_csv(index=False).encode("utf-8"),
-                               "Summary_main.csv", "text/csv", use_container_width=True)
+        # Single CSV (both tables together)
+        single_csv_blob = build_summary_single_csv(small_df, main_df)
+        st.download_button(
+            "⬇️ Download Summary (Single CSV)",
+            data=single_csv_blob,
+            file_name=f"Summary_{mode}.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
 
-        # Excel download (single sheet "Summary")
-        excel_blob = build_summary_excel(small_df, main_df)
-        with c3:
-            if excel_blob is not None:
-                st.download_button("⬇️ Download Summary (Excel)",
-                                   data=excel_blob,
-                                   file_name="Summary.xlsx",
-                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                   use_container_width=True)
-            else:
-                st.info("Excel engine unavailable; use the CSV downloads (or add openpyxl/xlsxwriter).")
+        # Excel (one sheet "Summary")
+        excel_blob = build_summary_excel(small_df, main_df, mode)
+        if excel_blob is not None:
+            st.download_button(
+                "⬇️ Download Summary (Excel)",
+                data=excel_blob,
+                file_name=f"Summary_{mode}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
+        else:
+            st.info("Excel engine unavailable; CSV export works. Add `openpyxl` or `xlsxwriter` in requirements to enable Excel.")
+
+        # Optional separate CSVs (advanced)
+        with st.expander("Advanced downloads (separate CSVs)"):
+            c1, c2 = st.columns(2)
+            with c1:
+                st.download_button("⬇️ Small (CSV)", small_df.to_csv(index=False).encode("utf-8"),
+                                   f"Summary_small_{mode}.csv", "text/csv", use_container_width=True)
+            with c2:
+                st.download_button("⬇️ Main (CSV)", main_df.to_csv(index=False).encode("utf-8"),
+                                   f"Summary_main_{mode}.csv", "text/csv", use_container_width=True)
 
         # Quick sanity footer
-        st.caption(f"Counts — Tracked: {int(small_df.loc[0, 'Shipment Count'])}, "
-                   f"Missed: {int(small_df.loc[1, 'Shipment Count'])}, "
-                   f"Untracked: {int(small_df.loc[2, 'Shipment Count'])}, "
-                   f"Total: {int(small_df.loc[3, 'Shipment Count'])}")
+        st.caption(
+            f"Counts — Tracked: {int(small_df.loc[0, 'Shipment Count'])}, "
+            f"Missed: {int(small_df.loc[1, 'Shipment Count'])}, "
+            f"Untracked: {int(small_df.loc[2, 'Shipment Count'])}, "
+            f"Total: {int(small_df.loc[3, 'Shipment Count'])}"
+        )
 
     except Exception as e:
         st.error(f"Could not process this file. Details: {e}")
