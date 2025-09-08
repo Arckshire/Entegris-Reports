@@ -8,8 +8,10 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# ---------- Try to ensure at least one Excel engine (xlsxwriter or openpyxl) ----------
-def _ensure_pkg(pkg_name, spec=None):
+# =========================
+# Dependency helpers
+# =========================
+def _ensure_pkg(pkg_name, spec=None) -> bool:
     try:
         __import__(pkg_name); return True
     except Exception:
@@ -22,12 +24,14 @@ def _ensure_pkg(pkg_name, spec=None):
     except Exception:
         return False
 
-def pick_xlsx_engine():
+def pick_xlsx_engine() -> str:
     if _ensure_pkg("xlsxwriter", "xlsxwriter>=3.2.0"): return "xlsxwriter"
     if _ensure_pkg("openpyxl",  "openpyxl>=3.1.5"):    return "openpyxl"
     return ""  # none available
 
-# ---------- Helpers ----------
+# =========================
+# Text/parse helpers
+# =========================
 def normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     keep = []
@@ -72,7 +76,9 @@ def split_city_state(value):
     if len(parts) == 2: return parts[0].strip(), parts[1].strip()
     return txt.strip(), ""
 
-# ---------- File loader (CSV/Excel) ----------
+# =========================
+# File loader (CSV/Excel)
+# =========================
 def load_table(uploaded_file) -> pd.DataFrame:
     raw = uploaded_file.read()
     name = (uploaded_file.name or "").lower()
@@ -96,7 +102,9 @@ def load_table(uploaded_file) -> pd.DataFrame:
     _ensure_pkg("openpyxl", "openpyxl>=3.1.5")
     return pd.read_excel(io.BytesIO(raw))
 
-# ---------- RAW → Data mapping ----------
+# =========================
+# RAW → Data mapping
+# =========================
 DATA_COLUMNS_ORDER = [
     "Carrier Name","Bill of Lading","Tracked","Pickup Name","Pickup City State","Pickup Country",
     "Dropoff Name","Dropoff City State","Dropoff Country","Final Status Reason",
@@ -121,7 +129,7 @@ def build_data_from_raw(df_raw: pd.DataFrame) -> pd.DataFrame:
     updates_passed = pd.to_numeric(col("# Updates Received < 10 mins"), errors="coerce")
 
     with np.errstate(divide="ignore", invalid="ignore"):
-        milestones_pct  = (rec / exp) * 100.0
+        milestones_pct   = (rec / exp) * 100.0
         ship_latency_pct = (updates_passed / updates_total) * 100.0
 
     data = pd.DataFrame({
@@ -148,9 +156,12 @@ def build_data_from_raw(df_raw: pd.DataFrame) -> pd.DataFrame:
         "Average Latency (min)": pd.to_numeric(col("Average Latency (min)"), errors="coerce"),
     })
 
+    # Ensure exact order
     return data[DATA_COLUMNS_ORDER]
 
-# ---------- V column + Summary builders ----------
+# =========================
+# V column + Summary builders
+# =========================
 def compute_in_transit_time_row(row):
     # Untracked if Tracked is FALSE-like OR Nb Milestones Received empty/0/NA
     tracked = row.get("Tracked", np.nan)
@@ -173,27 +184,31 @@ def compute_in_transit_time_row(row):
 def build_summary(df_data):
     v = df_data["In-Transit Time"]
     is_num = pd.to_numeric(v, errors="coerce").notna()
-    count_tracked  = int(is_num.sum())
-    count_missing  = int((v == "Missing Milestone").sum())
-    count_untracked= int((v == "Untracked").sum())
-    grand_total    = count_tracked + count_missing + count_untracked
+
+    count_tracked   = int(is_num.sum())
+    count_missing   = int((v == "Missing Milestone").sum())
+    count_untracked = int((v == "Untracked").sum())
+    grand_total     = count_tracked + count_missing + count_untracked
 
     numeric_vals = pd.to_numeric(v, errors="coerce")
-    avg_days_all = float(numeric_vals.dropna().mean()) if numeric_vals.notna().any() else np.nan
+    avg_days_all = float(numeric_vals.dropna().mean()) if numeric_vals.notna().any() else ""
 
-    # small summary table (no formatting, just values)
+    # small summary table (rows 1–5)
     small = pd.DataFrame({
         "Label": ["Tracked","Missed Milestone","Untracked","Grand Total"],
-        "Shipment Count": [count_tracked, count_missing, count_untracked, count_tracked + count_missing + count_untracked],
+        "Shipment Count": [count_tracked, count_missing, count_untracked, grand_total],
         "": ["","","",""],  # blank column
-        "Average of In-Transit Time": ["","","", avg_days_all if pd.notna(avg_days_all) else ""],
-        "Time taken from Departure to Arrival": ["","","",""],  # keep blank unless you want another KPI
+        "Average of In-Transit Time": ["","","", avg_days_all],
+        "Time taken from Departure to Arrival": ["","","",""],
     })
 
     # main table (only numeric V)
     df_num = df_data[is_num].copy()
-    pick_city, pick_state = zip(*df_num["Pickup City State"].map(split_city_state)) if len(df_num) else ([],[])
-    drop_city, drop_state = zip(*df_num["Dropoff City State"].map(split_city_state)) if len(df_num) else ([],[])
+    if len(df_num) > 0:
+        pick_city, pick_state = zip(*df_num["Pickup City State"].map(split_city_state))
+        drop_city, drop_state = zip(*df_num["Dropoff City State"].map(split_city_state))
+    else:
+        pick_city, pick_state, drop_city, drop_state = [], [], [], []
 
     main = pd.DataFrame({
         "Bill of Lading": df_num["Bill of Lading"].astype(str),
@@ -208,40 +223,38 @@ def build_summary(df_data):
         "Average of In-Transit Time": pd.to_numeric(df_num["In-Transit Time"], errors="coerce").astype("Int64"),
     })
 
-    # append Grand Total average row at the end of main
+    # Append Grand Total (average) row to main
     if len(main) > 0:
         javg = float(pd.to_numeric(main["Average of In-Transit Time"], errors="coerce").dropna().mean())
     else:
-        javg = np.nan
+        javg = ""
     total_row = {col: "" for col in main.columns}
     total_row["Bill of Lading"] = "Grand Total"
-    total_row["Average of In-Transit Time"] = javg if not pd.isna(javg) else ""
+    total_row["Average of In-Transit Time"] = javg
     main_with_total = pd.concat([main, pd.DataFrame([total_row])], ignore_index=True)
 
     return small, main_with_total
 
-# ---------- Write one XLSX OR ZIP CSV fallback ----------
+# =========================
+# Build one report (XLSX if possible; else single ZIP)
+# =========================
 def build_report_blob(df_data, small_summary, main_summary):
     engine = pick_xlsx_engine()
-
     if engine:
-        # Write clean .xlsx (no styling), Summary top table at rows 1–5, blank row 6, main from row 7
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine=engine) as writer:
             # Data sheet
             df_data.to_excel(writer, sheet_name="Data", index=False)
 
-            # Summary sheet: small table at top
+            # Summary sheet: small table at rows 1–5
             small_summary.to_excel(writer, sheet_name="Summary", index=False, startrow=0)
 
-            # blank row 6 (index 5) will remain blank because we start next table at startrow=6
-            # Main table starting row 7 (index 6)
+            # Row 6 blank; main table from row 7 (startrow=6)
             main_summary.to_excel(writer, sheet_name="Summary", index=False, startrow=6)
-
         buf.seek(0)
         return buf.getvalue(), "xlsx", "FTL_Data_and_Summary.xlsx"
 
-    # Fallback: one ZIP containing Data.csv + Summary_small.csv + Summary_main.csv
+    # Fallback: one ZIP with CSVs (so you still have a single download)
     zbuf = io.BytesIO()
     with zipfile.ZipFile(zbuf, "w", compression=zipfile.ZIP_DEFLATED) as z:
         z.writestr("Data.csv", df_data.to_csv(index=False))
@@ -250,7 +263,9 @@ def build_report_blob(df_data, small_summary, main_summary):
     zbuf.seek(0)
     return zbuf.getvalue(), "zip", "FTL_Report.zip"
 
-# ---------- Streamlit UI ----------
+# =========================
+# Streamlit UI
+# =========================
 st.set_page_config(page_title="FTL In-Transit Builder", page_icon="🚚", layout="wide")
 st.title("FTL In-Transit Time Processor (RAW → Data → Summary)")
 
@@ -259,6 +274,22 @@ uploaded = st.file_uploader("Upload RAW CSV or Excel", type=["csv", "xlsx", "xls
 if uploaded:
     try:
         raw_df  = load_table(uploaded)
+        raw_df  = normalize_headers(raw_df)
+
+        # QUICK sanity: show required columns missing (but continue with NaNs so you can see what's off)
+        expected_raw = [
+            "Carrier Name","Bill of Lading","Tracked","Pickup Name","Pickup City State","Pickup Country",
+            "Final Destination Name","Final Destination City State","Final Destination Country",
+            "Final Status Reason",
+            "Pickup Arrival Milestone (UTC)","Pickup Departure Milestone (UTC)",
+            "Final Destination Arrival Milestone (UTC)","Final Destination Departure Milestone (UTC)",
+            "# Of Milestones received / # Of Milestones expected",
+            "# Updates Received","# Updates Received < 10 mins","Average Latency (min)"
+        ]
+        missing = [c for c in expected_raw if c not in raw_df.columns]
+        if missing:
+            st.warning(f"Missing expected RAW columns (continuing — those fields will be blank): {missing}")
+
         data_df = build_data_from_raw(raw_df)
 
         # Column V: In-Transit Time (Untracked / Missing Milestone / rounded days)
@@ -279,10 +310,16 @@ if uploaded:
             use_container_width=True
         )
 
-        with st.expander("Preview: Data (A..U + V)"):
+        with st.expander("Preview: Data (first 50 rows)"):
             st.dataframe(data_df.head(50), use_container_width=True)
-        with st.expander("Preview: Summary main table"):
+        with st.expander("Preview: Summary (small 1–5 rows)"):
+            st.dataframe(small_df, use_container_width=True)
+        with st.expander("Preview: Summary (main; only numeric V)"):
             st.dataframe(main_df.head(50), use_container_width=True)
+
+        # Extra visibility so you can verify the logic quickly
+        st.caption(f"Rows total: {len(data_df):,} | Numeric V rows (Tracked): {(pd.to_numeric(data_df['In-Transit Time'], errors='coerce').notna()).sum():,} | "
+                   f"Untracked: {(data_df['In-Transit Time']=='Untracked').sum():,} | Missing Milestone: {(data_df['In-Transit Time']=='Missing Milestone').sum():,}")
 
     except Exception as e:
         st.error(f"Could not process this file. Details: {e}")
