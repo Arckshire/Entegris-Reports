@@ -4,13 +4,12 @@ import re
 import sys
 import subprocess
 import zipfile
+import datetime as dt
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-# =========================
-# Dependency helpers
-# =========================
+# ============ dependency helpers ============
 def _ensure_pkg(pkg_name, spec=None) -> bool:
     try:
         __import__(pkg_name); return True
@@ -27,11 +26,9 @@ def _ensure_pkg(pkg_name, spec=None) -> bool:
 def pick_xlsx_engine() -> str:
     if _ensure_pkg("xlsxwriter", "xlsxwriter>=3.2.0"): return "xlsxwriter"
     if _ensure_pkg("openpyxl",  "openpyxl>=3.1.5"):    return "openpyxl"
-    return ""  # none available
+    return ""  # neither available
 
-# =========================
-# Text/parse helpers
-# =========================
+# ============ text/parse helpers ============
 def normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     keep = []
@@ -76,9 +73,7 @@ def split_city_state(value):
     if len(parts) == 2: return parts[0].strip(), parts[1].strip()
     return txt.strip(), ""
 
-# =========================
-# File loader (CSV/Excel)
-# =========================
+# ============ robust loader (CSV/Excel) ============
 def load_table(uploaded_file) -> pd.DataFrame:
     raw = uploaded_file.read()
     name = (uploaded_file.name or "").lower()
@@ -102,9 +97,70 @@ def load_table(uploaded_file) -> pd.DataFrame:
     _ensure_pkg("openpyxl", "openpyxl>=3.1.5")
     return pd.read_excel(io.BytesIO(raw))
 
-# =========================
-# RAW → Data mapping
-# =========================
+# ============ find RAW ratio column robustly ============
+def find_ratio_col(df: pd.DataFrame) -> str | None:
+    # try exact first
+    exact = "# Of Milestones received / # Of Milestones expected"
+    if exact in df.columns: return exact
+    # case/space-insensitive fallback
+    def norm(s): return re.sub(r"[^a-z]", "", str(s).lower())
+    want = ["milestones","received","expected"]
+    for c in df.columns:
+        n = norm(c)
+        if all(w in n for w in want) and "/" in str(c):
+            return c
+    # last resort: any column that looks like "x / y"
+    for c in df.columns:
+        if re.search(r"\d\s*/\s*\d", str(df[c].astype(str).head(20).tolist())):
+            return c
+    return None
+
+# ============ ratio parser that recovers from dates ============
+def parse_ratio_cell(val):
+    """Return (received, expected) from a cell that might be '1/4', a datetime (1-Apr),
+       or an Excel serial date number."""
+    if val is None or (isinstance(val, float) and np.isnan(val)) or (isinstance(val, str) and not val.strip()):
+        return (np.nan, np.nan)
+
+    # Datetime (Excel auto-date like 1/4 -> 1-Apr-[year])
+    if isinstance(val, (pd.Timestamp, dt.datetime, dt.date)):
+        m, d = int(getattr(val, "month")), int(getattr(val, "day"))
+        return (m, d)
+
+    # Numeric: maybe Excel serial date
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        # Excel serial dates are typically > 59; convert then take month/day
+        if val > 59 and val < 60000:
+            base = dt.datetime(1899, 12, 30)
+            as_dt = base + dt.timedelta(days=float(val))
+            return (as_dt.month, as_dt.day)
+        # otherwise just treat as received with unknown expected
+        try:
+            return (int(val), np.nan)
+        except Exception:
+            return (np.nan, np.nan)
+
+    # String cases
+    s = str(val).strip()
+    # pure ratio like "1/4" or " 1 / 4 "
+    m = re.match(r"^\s*(\d+)\s*/\s*(\d+)\s*$", s)
+    if m:
+        return (int(m.group(1)), int(m.group(2)))
+
+    # loose fallback: grab first two integers in order
+    m2 = re.findall(r"(-?\d+)", s)
+    if len(m2) >= 2:
+        return (int(m2[0]), int(m2[1]))
+
+    return (np.nan, np.nan)
+
+def parse_received_expected(series_ratio: pd.Series):
+    rec_exp = series_ratio.apply(parse_ratio_cell)
+    rec = pd.to_numeric(rec_exp.apply(lambda t: t[0]), errors="coerce")
+    exp = pd.to_numeric(rec_exp.apply(lambda t: t[1]), errors="coerce")
+    return rec, exp
+
+# ============ RAW → Data mapping ============
 DATA_COLUMNS_ORDER = [
     "Carrier Name","Bill of Lading","Tracked","Pickup Name","Pickup City State","Pickup Country",
     "Dropoff Name","Dropoff City State","Dropoff Country","Final Status Reason",
@@ -115,16 +171,16 @@ DATA_COLUMNS_ORDER = [
     "Average Latency (min)",
 ]
 
-def parse_received_expected(series_ratio: pd.Series):
-    s = series_ratio.astype(str)
-    m = s.str.extract(r"(-?\d+)\s*/\s*(-?\d+)")
-    return pd.to_numeric(m[0], errors="coerce"), pd.to_numeric(m[1], errors="coerce")
-
 def build_data_from_raw(df_raw: pd.DataFrame) -> pd.DataFrame:
     df = normalize_headers(df_raw); n = len(df)
     def col(name): return df.get(name, pd.Series([np.nan]*n))
 
-    rec, exp = parse_received_expected(col("# Of Milestones received / # Of Milestones expected"))
+    ratio_col = find_ratio_col(df)
+    if ratio_col is not None:
+        rec, exp = parse_received_expected(df[ratio_col])
+    else:
+        rec = pd.Series([np.nan]*n); exp = pd.Series([np.nan]*n)
+
     updates_total  = pd.to_numeric(col("# Updates Received"), errors="coerce")
     updates_passed = pd.to_numeric(col("# Updates Received < 10 mins"), errors="coerce")
 
@@ -156,20 +212,16 @@ def build_data_from_raw(df_raw: pd.DataFrame) -> pd.DataFrame:
         "Average Latency (min)": pd.to_numeric(col("Average Latency (min)"), errors="coerce"),
     })
 
-    # Ensure exact order
     return data[DATA_COLUMNS_ORDER]
 
-# =========================
-# V column + Summary builders
-# =========================
+# ============ V column + Summary builders ============
 def compute_in_transit_time_row(row):
-    # Untracked if Tracked is FALSE-like OR Nb Milestones Received empty/0/NA
     tracked = row.get("Tracked", np.nan)
     nb_recv = as_int_or_nan(row.get("Nb Milestones Received", np.nan))
+    # Untracked if tracked is FALSE-like OR received is 0/empty
     if is_false_like(tracked) or (pd.isna(nb_recv) or nb_recv == 0):
         return "Untracked"
 
-    # Compute days (Dropoff Arrival - Pickup Departure), round .5 up
     pick_dep = parse_timestamp(row.get("Pickup Departure Utc Timestamp Raw"))
     drop_arr = parse_timestamp(row.get("Dropoff Arrival Utc Timestamp Raw"))
     if pd.isna(pick_dep) or pd.isna(drop_arr):
@@ -193,16 +245,14 @@ def build_summary(df_data):
     numeric_vals = pd.to_numeric(v, errors="coerce")
     avg_days_all = float(numeric_vals.dropna().mean()) if numeric_vals.notna().any() else ""
 
-    # small summary table (rows 1–5)
     small = pd.DataFrame({
         "Label": ["Tracked","Missed Milestone","Untracked","Grand Total"],
         "Shipment Count": [count_tracked, count_missing, count_untracked, grand_total],
-        "": ["","","",""],  # blank column
+        "": ["","","",""],
         "Average of In-Transit Time": ["","","", avg_days_all],
         "Time taken from Departure to Arrival": ["","","",""],
     })
 
-    # main table (only numeric V)
     df_num = df_data[is_num].copy()
     if len(df_num) > 0:
         pick_city, pick_state = zip(*df_num["Pickup City State"].map(split_city_state))
@@ -223,7 +273,6 @@ def build_summary(df_data):
         "Average of In-Transit Time": pd.to_numeric(df_num["In-Transit Time"], errors="coerce").astype("Int64"),
     })
 
-    # Append Grand Total (average) row to main
     if len(main) > 0:
         javg = float(pd.to_numeric(main["Average of In-Transit Time"], errors="coerce").dropna().mean())
     else:
@@ -235,26 +284,18 @@ def build_summary(df_data):
 
     return small, main_with_total
 
-# =========================
-# Build one report (XLSX if possible; else single ZIP)
-# =========================
+# ============ write one report (XLSX if possible; else ZIP CSV) ============
 def build_report_blob(df_data, small_summary, main_summary):
     engine = pick_xlsx_engine()
     if engine:
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine=engine) as writer:
-            # Data sheet
             df_data.to_excel(writer, sheet_name="Data", index=False)
-
-            # Summary sheet: small table at rows 1–5
             small_summary.to_excel(writer, sheet_name="Summary", index=False, startrow=0)
-
-            # Row 6 blank; main table from row 7 (startrow=6)
-            main_summary.to_excel(writer, sheet_name="Summary", index=False, startrow=6)
+            main_summary.to_excel(writer, sheet_name="Summary", index=False, startrow=6)  # row 7 in Excel
         buf.seek(0)
         return buf.getvalue(), "xlsx", "FTL_Data_and_Summary.xlsx"
 
-    # Fallback: one ZIP with CSVs (so you still have a single download)
     zbuf = io.BytesIO()
     with zipfile.ZipFile(zbuf, "w", compression=zipfile.ZIP_DEFLATED) as z:
         z.writestr("Data.csv", df_data.to_csv(index=False))
@@ -263,9 +304,7 @@ def build_report_blob(df_data, small_summary, main_summary):
     zbuf.seek(0)
     return zbuf.getvalue(), "zip", "FTL_Report.zip"
 
-# =========================
-# Streamlit UI
-# =========================
+# ============ Streamlit UI ============
 st.set_page_config(page_title="FTL In-Transit Builder", page_icon="🚚", layout="wide")
 st.title("FTL In-Transit Time Processor (RAW → Data → Summary)")
 
@@ -276,29 +315,15 @@ if uploaded:
         raw_df  = load_table(uploaded)
         raw_df  = normalize_headers(raw_df)
 
-        # QUICK sanity: show required columns missing (but continue with NaNs so you can see what's off)
-        expected_raw = [
-            "Carrier Name","Bill of Lading","Tracked","Pickup Name","Pickup City State","Pickup Country",
-            "Final Destination Name","Final Destination City State","Final Destination Country",
-            "Final Status Reason",
-            "Pickup Arrival Milestone (UTC)","Pickup Departure Milestone (UTC)",
-            "Final Destination Arrival Milestone (UTC)","Final Destination Departure Milestone (UTC)",
-            "# Of Milestones received / # Of Milestones expected",
-            "# Updates Received","# Updates Received < 10 mins","Average Latency (min)"
-        ]
-        missing = [c for c in expected_raw if c not in raw_df.columns]
-        if missing:
-            st.warning(f"Missing expected RAW columns (continuing — those fields will be blank): {missing}")
-
         data_df = build_data_from_raw(raw_df)
 
-        # Column V: In-Transit Time (Untracked / Missing Milestone / rounded days)
+        # Column V: In-Transit Time
         data_df["In-Transit Time"] = data_df.apply(compute_in_transit_time_row, axis=1)
 
         # Summary sheets
         small_df, main_df = build_summary(data_df)
 
-        # Build single report (XLSX if engine available; else ZIP with CSVs)
+        # Build single report
         blob, ext, fname = build_report_blob(data_df, small_df, main_df)
 
         st.success("Processed! Download your report below.")
@@ -317,9 +342,12 @@ if uploaded:
         with st.expander("Preview: Summary (main; only numeric V)"):
             st.dataframe(main_df.head(50), use_container_width=True)
 
-        # Extra visibility so you can verify the logic quickly
-        st.caption(f"Rows total: {len(data_df):,} | Numeric V rows (Tracked): {(pd.to_numeric(data_df['In-Transit Time'], errors='coerce').notna()).sum():,} | "
-                   f"Untracked: {(data_df['In-Transit Time']=='Untracked').sum():,} | Missing Milestone: {(data_df['In-Transit Time']=='Missing Milestone').sum():,}")
+        # quick sanity line
+        st.caption(
+            f"Rows: {len(data_df):,} | numeric V: {(pd.to_numeric(data_df['In-Transit Time'], errors='coerce').notna()).sum():,} "
+            f"| Untracked: {(data_df['In-Transit Time']=='Untracked').sum():,} "
+            f"| Missing: {(data_df['In-Transit Time']=='Missing Milestone').sum():,}"
+        )
 
     except Exception as e:
         st.error(f"Could not process this file. Details: {e}")
