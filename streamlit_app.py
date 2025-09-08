@@ -311,7 +311,7 @@ def process_uploaded_file(uploaded_file, selected_mode="FTL"):
 # Streamlit UI
 # ---------------------------------------------
 st.set_page_config(page_title="FTL In-Transit Builder", page_icon="🚚", layout="wide")
-st.title("FTL In-Transit Time Processor")
+st.title("Integris Report")
 
 col_mode, col_info = st.columns([1, 3])
 with col_mode:
