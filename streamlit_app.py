@@ -8,20 +8,15 @@ import pandas as pd
 import streamlit as st
 
 # --------------------------------------------------
-# Tiny installer. We'll try to install missing deps at runtime (Streamlit Cloud supports this).
+# Auto-install helper (for openpyxl/xlsxwriter if missing)
 # --------------------------------------------------
 def _ensure_pkg(pkg_name, spec=None):
-    """
-    Ensure a package is importable; if not, pip install it.
-    Returns True if importable after, else False.
-    """
     try:
         __import__(pkg_name)
         return True
     except Exception:
         pass
     try:
-        # Show a small message in the UI while installing
         with st.spinner(f"Installing dependency: {pkg_name}…"):
             cmd = [sys.executable, "-m", "pip", "install", spec or pkg_name]
             subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -32,38 +27,28 @@ def _ensure_pkg(pkg_name, spec=None):
 
 @st.cache_resource(show_spinner=False)
 def ensure_excel_engine_for_write() -> str:
-    """
-    Prefer xlsxwriter for better styling. If not available, ensure openpyxl.
-    Returns the engine name we will use for writing: 'xlsxwriter' or 'openpyxl'.
-    """
     if _ensure_pkg("xlsxwriter", "xlsxwriter>=3.2.0"):
         return "xlsxwriter"
     if _ensure_pkg("openpyxl", "openpyxl>=3.1.5"):
         return "openpyxl"
-    # If both fail, we can't write Excel; we'll handle that later in UI.
     return ""
 
 @st.cache_resource(show_spinner=False)
 def ensure_excel_reader():
-    """
-    Ensure we can read .xlsx. Pandas prefers openpyxl for .xlsx.
-    """
     _ensure_pkg("openpyxl", "openpyxl>=3.1.5")
 
 
 # --------------------------------------------------
-# Header / text helpers
+# Utilities
 # --------------------------------------------------
 def normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    # Drop empty/unnamed columns
     keep_cols = []
     for c in df.columns:
         s = str(c).strip()
         if s and not s.lower().startswith("unnamed"):
             keep_cols.append(c)
     df = df.loc[:, keep_cols]
-    # Clean spaces
     df.columns = [re.sub(r"\s+", " ", str(c).strip()) for c in df.columns]
     return df
 
@@ -128,7 +113,6 @@ def load_table(uploaded_file) -> pd.DataFrame:
             ensure_excel_reader()
             return pd.read_excel(io.BytesIO(raw))
         except Exception:
-            # fall through to CSV attempts
             pass
 
     # Try CSV with multiple encodings + sniffer
@@ -139,7 +123,7 @@ def load_table(uploaded_file) -> pd.DataFrame:
         except Exception:
             continue
 
-    # Last resort try Excel again (some CSVs are disguised xlsx)
+    # Last resort: attempt Excel again
     ensure_excel_reader()
     return pd.read_excel(io.BytesIO(raw))
 
@@ -185,10 +169,8 @@ def build_data_from_raw(df_raw: pd.DataFrame) -> pd.DataFrame:
     def col(name):
         return df.get(name, pd.Series([np.nan] * n))
 
-    # Parse milestones received/expected from the ratio column
     rec, exp = parse_received_expected(col("# Of Milestones received / # Of Milestones expected"))
 
-    # Shipment latency % from updates within 10 mins vs total updates
     updates_total = pd.to_numeric(col("# Updates Received"), errors="coerce")
     updates_passed = pd.to_numeric(col("# Updates Received < 10 mins"), errors="coerce")
 
@@ -225,17 +207,15 @@ def build_data_from_raw(df_raw: pd.DataFrame) -> pd.DataFrame:
 
 
 # --------------------------------------------------
-# V column logic + Summary
+# V column logic + Summary dataframes
 # --------------------------------------------------
 def compute_in_transit_time_row(row):
-    # Untracked rule
     tracked_val = row.get("Tracked", np.nan)
     nb_recv = row.get("Nb Milestones Received", np.nan)
     milestones_i = as_int_or_nan(nb_recv)
     if is_false_like(tracked_val) or (pd.isna(milestones_i) or milestones_i == 0):
         return "Untracked"
 
-    # Compute days = Dropoff Arrival - Pickup Departure
     pick_dep = parse_timestamp(row.get("Pickup Departure Utc Timestamp Raw"))
     drop_arr = parse_timestamp(row.get("Dropoff Arrival Utc Timestamp Raw"))
     if pd.isna(pick_dep) or pd.isna(drop_arr):
@@ -277,90 +257,100 @@ def build_summary_sheet(df_data):
         "Average of In-Transit Time": pd.to_numeric(df_numeric["In-Transit Time"], errors="coerce").astype("Int64"),
     })
 
-    small_table = pd.DataFrame({
-        "Label": ["Tracked", "Missed Milestone", "Untracked", "Grand Total"],
-        "Shipment Count": [count_tracked, count_missing, count_untracked, grand_total],
-        "Average of In-Transit Time (days)": [np.nan, np.nan, np.nan, avg_days_all],
-        "Time taken from Departure to Arrival": [np.nan, np.nan, np.nan, avg_days_all],
-    })
-
-    return summary_main, small_table
+    small_counts = {
+        "tracked": count_tracked,
+        "missed": count_missing,
+        "untracked": count_untracked,
+        "grand": grand_total,
+        "avg": avg_days_all,
+    }
+    return summary_main, small_counts
 
 
 # --------------------------------------------------
-# Excel writer (uses whichever engine we have)
+# Excel writer (Summary exactly per spec; single report)
 # --------------------------------------------------
-def write_excel_with_formatting(df_data, summary_main, small_table):
+def write_excel_with_formatting(df_data, summary_main, small_counts):
     engine = ensure_excel_engine_for_write()
     if engine == "xlsxwriter":
-        return _write_with_xlsxwriter(df_data, summary_main, small_table)
+        return _write_with_xlsxwriter(df_data, summary_main, small_counts)
     elif engine == "openpyxl":
-        return _write_with_openpyxl(df_data, summary_main, small_table)
+        return _write_with_openpyxl(df_data, summary_main, small_counts)
     else:
-        # No engine available (install failed). We’ll raise and let UI show a friendly note.
         raise RuntimeError("Neither 'xlsxwriter' nor 'openpyxl' are available to write Excel.")
 
-def _write_with_xlsxwriter(df_data, summary_main, small_table):
+def _write_with_xlsxwriter(df_data, summary_main, sc):
     import xlsxwriter  # noqa: F401
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        # Data sheet
         df_data.to_excel(writer, sheet_name="Data", index=False)
+        ws_data = writer.sheets["Data"]
+        for idx, col in enumerate(df_data.columns):
+            width = min(50, max(12, int(df_data[col].astype(str).str.len().quantile(0.9)) + 2))
+            ws_data.set_column(idx, idx, width)
 
+        # Summary sheet
         wb = writer.book
         ws = wb.add_worksheet("Summary")
 
-        fmt_header = wb.add_format({"bold": True, "bg_color": "#D9EDF7", "border": 1})
+        fmt_blue_bold_border = wb.add_format({"bold": True, "bg_color": "#D9EDF7", "border": 1})
         fmt_bold = wb.add_format({"bold": True})
         fmt_border = wb.add_format({"border": 1})
 
-        # Column widths (Summary)
-        ws.set_column("A:A", 22)
-        ws.set_column("B:B", 18)
-        ws.set_column("C:C", 2)   # blank separator
-        ws.set_column("D:D", 28)
-        ws.set_column("E:E", 34)
-        ws.set_column("F:J", 22)
+        # Column widths for A–J
+        ws.set_column("A:A", 22)  # Label / Bill of Lading
+        ws.set_column("B:B", 18)  # Shipment Count / Pickup Name
+        ws.set_column("C:C", 10)  # BLANK separator (top table) / Pickup City
+        ws.set_column("D:D", 28)  # Average of In-Transit Time / Pickup State
+        ws.set_column("E:E", 34)  # Time taken... / Pickup Country
+        ws.set_column("F:J", 22)  # Remaining main columns
 
-        # Small table rows 1–5
-        ws.write(0, 0, "Label", fmt_header)
-        ws.write(0, 1, "Shipment Count", fmt_header)
-        ws.write(0, 2, "", fmt_border)
-        ws.write(0, 3, "Average of In-Transit Time", fmt_header)
-        ws.write(0, 4, "Time taken from Departure to Arrival", fmt_border)
+        # ----- Small table rows 1–5 (A..E) -----
+        # Headers: A1 blue+bold, B1 blue+bold, C1 blank (border), D1 blue+bold, E1 normal
+        ws.write(0, 0, "Label", fmt_blue_bold_border)                       # A1
+        ws.write(0, 1, "Shipment Count", fmt_blue_bold_border)              # B1
+        ws.write(0, 2, "", fmt_border)                                      # C1 (blank)
+        ws.write(0, 3, "Average of In-Transit Time", fmt_blue_bold_border)  # D1
+        ws.write(0, 4, "Time taken from Departure to Arrival", fmt_border)  # E1
 
+        # A2..A4
         ws.write(1, 0, "Tracked")
         ws.write(2, 0, "Missed Milestone")
         ws.write(3, 0, "Untracked")
-        ws.write(4, 0, "Grand Total", fmt_header)
+        # A5 blue+bold
+        ws.write(4, 0, "Grand Total", fmt_blue_bold_border)                 # A5
 
-        ws.write_number(1, 1, int(small_table.loc[0, "Shipment Count"]))
-        ws.write_number(2, 1, int(small_table.loc[1, "Shipment Count"]))
-        ws.write_number(3, 1, int(small_table.loc[2, "Shipment Count"]))
-        ws.write_number(4, 1, int(small_table.loc[3, "Shipment Count"]))
+        # Counts in column B, B5 = SUM(B2:B4) and blue+bold
+        ws.write_number(1, 1, int(sc["tracked"]))                           # B2
+        ws.write_number(2, 1, int(sc["missed"]))                            # B3
+        ws.write_number(3, 1, int(sc["untracked"]))                         # B4
+        ws.write_formula(4, 1, "=SUM(B2:B4)", fmt_blue_bold_border)         # B5
 
-        avg_days_all = small_table.loc[3, "Average of In-Transit Time (days)"]
-        if pd.notna(avg_days_all):
-            ws.write_number(4, 3, float(avg_days_all))
-            ws.write_number(4, 4, float(avg_days_all))
+        # Put overall average in D5 (E5 left blank unless you want a different KPI later)
+        if pd.notna(sc["avg"]):
+            ws.write_number(4, 3, float(sc["avg"]))                         # D5
         else:
-            ws.write(4, 3, "")
-            ws.write(4, 4, "")
+            ws.write(4, 3, "")                                              # D5
 
-        # Borders on A2:E5
+        # Borders around A2:E5
         for r in range(1, 5):
             for c in range(0, 5):
                 ws.write_blank(r, c, None, fmt_border)
 
-        # Main table starting row 7
-        start_row = 6
+        # ----- Row 6 blank -----
+
+        # ----- Main table starting row 7 -----
+        start_row = 6  # 0-based -> Excel row 7
         headers = [
             "Bill of Lading", "Pickup Name", "Pickup City", "Pickup State", "Pickup Country",
             "Dropoff Name", "Dropoff City", "Dropoff State", "Dropoff Country",
             "Average of In-Transit Time"
         ]
         for c, h in enumerate(headers):
-            ws.write(start_row, c, h, fmt_header)
+            ws.write(start_row, c, h, fmt_blue_bold_border)
 
+        # Data rows
         for i, (_, row) in enumerate(summary_main.iterrows(), start=1):
             r = start_row + i
             for c_idx, col_name in enumerate(headers):
@@ -378,33 +368,35 @@ def _write_with_xlsxwriter(df_data, summary_main, small_table):
                 else:
                     ws.write(r, c_idx, "" if pd.isna(val) else str(val))
 
+        # Grand Total row after data
         last_data_row = start_row + len(summary_main) + 1
-        ws.write(last_data_row, 0, "Grand Total", fmt_header)
+        ws.write(last_data_row, 0, "Grand Total", fmt_blue_bold_border)     # A{end}
         if len(summary_main) > 0:
             first_j = start_row + 1
             last_j = start_row + len(summary_main)
-            ws.write_formula(last_data_row, 9, f"=AVERAGE(J{first_j+1}:J{last_j+1})", fmt_header)
+            ws.write_formula(last_data_row, 9, f"=AVERAGE(J{first_j+1}:J{last_j+1})", fmt_blue_bold_border)
         else:
-            ws.write(last_data_row, 9, "", fmt_header)
-
-        # Autosize Data sheet columns
-        ws_data = writer.sheets["Data"]
-        for idx, col in enumerate(df_data.columns):
-            width = min(50, max(12, int(df_data[col].astype(str).str.len().quantile(0.9)) + 2))
-            ws_data.set_column(idx, idx, width)
+            ws.write(last_data_row, 9, "", fmt_blue_bold_border)
 
     output.seek(0)
     return output
 
-def _write_with_openpyxl(df_data, summary_main, small_table):
-    # openpyxl path
+def _write_with_openpyxl(df_data, summary_main, sc):
     _ = _ensure_pkg("openpyxl", "openpyxl>=3.1.5")
     from openpyxl.styles import Font, PatternFill, Border, Side
     from openpyxl.utils import get_column_letter
 
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        # Data sheet
         df_data.to_excel(writer, sheet_name="Data", index=False)
+        ws_data = writer.sheets["Data"]
+        for idx, col in enumerate(df_data.columns, start=1):
+            lens = df_data[col].astype(str).str.len()
+            q = int(lens.quantile(0.9)) if len(lens) else 12
+            ws_data.column_dimensions[get_column_letter(idx)].width = min(50, max(12, q + 2))
+
+        # Summary sheet
         wb = writer.book
         ws = wb.create_sheet("Summary")
 
@@ -423,38 +415,44 @@ def _write_with_openpyxl(df_data, summary_main, small_table):
                 cell.border = border
             return cell
 
-        # Set column widths
-        widths = {1: 22, 2: 18, 3: 2, 4: 28, 5: 34, 6: 22, 7: 22, 8: 18, 9: 18, 10: 22}
+        # Column widths for A–J
+        widths = {1: 22, 2: 18, 3: 10, 4: 28, 5: 34, 6: 22, 7: 22, 8: 18, 9: 18, 10: 22}
         for col_idx, w in widths.items():
             ws.column_dimensions[get_column_letter(col_idx)].width = w
 
-        # Small table headers and rows
-        set_cell(1, 1, "Label", blue=True, bold=True, bordered=True)
-        set_cell(1, 2, "Shipment Count", blue=True, bold=True, bordered=True)
-        set_cell(1, 3, "", bordered=True)
-        set_cell(1, 4, "Average of In-Transit Time", blue=True, bold=True, bordered=True)
-        set_cell(1, 5, "Time taken from Departure to Arrival", bordered=True)
+        # ----- Small table rows 1–5 (A..E) -----
+        set_cell(1, 1, "Label", blue=True, bold=True, bordered=True)                   # A1
+        set_cell(1, 2, "Shipment Count", blue=True, bold=True, bordered=True)          # B1
+        set_cell(1, 3, "", bordered=True)                                              # C1 (blank)
+        set_cell(1, 4, "Average of In-Transit Time", blue=True, bold=True, bordered=True)  # D1
+        set_cell(1, 5, "Time taken from Departure to Arrival", bordered=True)          # E1
 
         set_cell(2, 1, "Tracked")
         set_cell(3, 1, "Missed Milestone")
         set_cell(4, 1, "Untracked")
-        set_cell(5, 1, "Grand Total", blue=True, bold=True, bordered=True)
+        set_cell(5, 1, "Grand Total", blue=True, bold=True, bordered=True)             # A5
 
-        set_cell(2, 2, int(small_table.loc[0, "Shipment Count"]))
-        set_cell(3, 2, int(small_table.loc[1, "Shipment Count"]))
-        set_cell(4, 2, int(small_table.loc[2, "Shipment Count"]))
-        set_cell(5, 2, int(small_table.loc[3, "Shipment Count"]))
+        # B2..B4 counts; B5 sum & blue+bold
+        set_cell(2, 2, int(sc["tracked"]))
+        set_cell(3, 2, int(sc["missed"]))
+        set_cell(4, 2, int(sc["untracked"]))
+        b5 = ws.cell(row=5, column=2)
+        b5.value = "=SUM(B2:B4)"
+        b5.fill = blue_fill
+        b5.font = bold_font
+        b5.border = border
 
-        avg_days_all = small_table.loc[3, "Average of In-Transit Time (days)"]
-        set_cell(5, 4, float(avg_days_all) if pd.notna(avg_days_all) else "")
-        set_cell(5, 5, float(avg_days_all) if pd.notna(avg_days_all) else "")
+        # D5 overall average (E5 left blank)
+        set_cell(5, 4, float(sc["avg"]) if pd.notna(sc["avg"]) else "")
 
-        # borders for the small area A2:E5
+        # Borders around A2:E5
         for r in range(2, 6):
             for c in range(1, 6):
                 ws.cell(row=r, column=c).border = border
 
-        # Main table
+        # Row 6 blank
+
+        # Main table starting row 7
         header_row = 7
         headers = [
             "Bill of Lading", "Pickup Name", "Pickup City", "Pickup State", "Pickup Country",
@@ -464,6 +462,7 @@ def _write_with_openpyxl(df_data, summary_main, small_table):
         for c, h in enumerate(headers, start=1):
             set_cell(header_row, c, h, blue=True, bold=True, bordered=True)
 
+        # Data rows
         for i, (_, row) in enumerate(summary_main.iterrows(), start=1):
             r = header_row + i
             for c_idx, col_name in enumerate(headers, start=1):
@@ -480,37 +479,26 @@ def _write_with_openpyxl(df_data, summary_main, small_table):
                         except Exception:
                             pass
 
-        # Grand total row
+        # Grand Total row
         last_data_row = header_row + len(summary_main) + 1
         set_cell(last_data_row, 1, "Grand Total", blue=True, bold=True, bordered=True)
         if len(summary_main) > 0:
             first_j = header_row + 1
             last_j = header_row + len(summary_main)
-            ws.cell(row=last_data_row, column=10).value = f"=AVERAGE(J{first_j}:J{last_j})"
-            cell = ws.cell(row=last_data_row, column=10)
-            cell.fill = blue_fill
-            cell.font = bold_font
-            cell.border = border
+            jcell = ws.cell(row=last_data_row, column=10)
+            jcell.value = f"=AVERAGE(J{first_j}:J{last_j})"
+            jcell.fill = blue_fill
+            jcell.font = bold_font
+            jcell.border = border
         else:
             set_cell(last_data_row, 10, "", blue=True, bold=True, bordered=True)
-
-        # Autosize-ish Data sheet columns
-        ws_data = writer.sheets.get("Data")
-        if ws_data is not None:
-            df_cols = list(df_data.columns)
-            from openpyxl.utils import get_column_letter as _gcl
-            for idx, col in enumerate(df_cols, start=1):
-                lens = df_data[col].astype(str).str.len()
-                q = int(lens.quantile(0.9)) if len(lens) else 12
-                width = min(50, max(12, q + 2))
-                ws_data.column_dimensions[_gcl(idx)].width = width
 
     output.seek(0)
     return output
 
 
 # --------------------------------------------------
-# Streamlit UI and flow
+# Streamlit UI & flow
 # --------------------------------------------------
 st.set_page_config(page_title="FTL In-Transit Builder", page_icon="🚚", layout="wide")
 st.title("FTL In-Transit Time Processor (RAW → Data → Summary)")
@@ -535,41 +523,28 @@ if uploaded is not None:
         # Compute V on the Data sheet
         df_data["In-Transit Time"] = df_data.apply(compute_in_transit_time_row, axis=1)
 
-        # Summary
-        summary_main, small_table = build_summary_sheet(df_data)
+        # Build Summary parts
+        summary_main, small_counts = build_summary_sheet(df_data)
 
-        # Full Excel (Data + Summary), with engine fallback
+        # Build single Excel report (Data + Summary)
         try:
-            excel_bytes = write_excel_with_formatting(df_data, summary_main, small_table)
-            excel_ok = True
+            excel_bytes = write_excel_with_formatting(df_data, summary_main, small_counts)
+            st.success("Processed! Click below to download your Excel report.")
+            st.download_button(
+                "⬇️ Download Report (Excel)",
+                data=excel_bytes,
+                file_name="FTL_Data_and_Summary.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
         except Exception as ex:
-            excel_ok = False
-            st.warning(f"Excel export engine unavailable. You can still download CSVs. Details: {ex}")
+            st.error(f"Could not generate Excel report. Details: {ex}")
 
-        st.success("Processed! Preview below and use the download buttons.")
-
+        # Optional previews (won't affect export)
         with st.expander("Preview: Data (A..U + V)"):
             st.dataframe(df_data.head(50))
         with st.expander("Preview: Summary main table"):
             st.dataframe(summary_main.head(50))
-
-        # Downloads
-        data_csv = df_data.to_csv(index=False).encode("utf-8")
-        summary_csv = summary_main.to_csv(index=False).encode("utf-8")
-
-        c1, c2 = st.columns(2)
-        with c1:
-            st.download_button("⬇️ Download Data (CSV)", data=data_csv, file_name="Data_FTL.csv",
-                               mime="text/csv", use_container_width=True)
-            if excel_ok:
-                st.download_button("⬇️ Download Data (Excel)", data=excel_bytes, file_name="Data_and_Summary_FTL.xlsx",
-                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
-        with c2:
-            st.download_button("⬇️ Download Summary (CSV)", data=summary_csv, file_name="Summary_FTL.csv",
-                               mime="text/csv", use_container_width=True)
-            if excel_ok:
-                st.download_button("⬇️ Download Full Excel (Data + Summary)", data=excel_bytes, file_name="Data_and_Summary_FTL.xlsx",
-                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
 
     except Exception as e:
         st.error(f"Could not process this file. Details: {e}")
