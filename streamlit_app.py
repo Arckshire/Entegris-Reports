@@ -2,31 +2,33 @@ import io
 import math
 import re
 import codecs
-import csv
-from datetime import datetime, timezone
+from typing import Tuple
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
 # ---------------------------------------------
-# Helper functions
+# Utilities
 # ---------------------------------------------
-def parse_timestamp(s):
-    if pd.isna(s):
-        return pd.NaT
-    try:
-        return pd.to_datetime(s, utc=True, errors="coerce")
-    except Exception:
-        return pd.NaT
+def normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    # Drop columns with empty header like "", "Unnamed: 0"
+    df = df.loc[:, [c for c in df.columns if str(c).strip() != ""]]
+    df.columns = [re.sub(r"\s+", " ", str(c).strip()) for c in df.columns]
+    return df
 
 def is_missing_like(x):
     if pd.isna(x):
         return True
-    if isinstance(x, str):
-        val = x.strip().lower()
-        return val in {"", "na", "n/a", "null", "none"}
+    if isinstance(x, str) and x.strip().lower() in {"", "na", "n/a", "null", "none"}:
+        return True
     return False
+
+def parse_timestamp(s):
+    if pd.isna(s):
+        return pd.NaT
+    return pd.to_datetime(s, utc=True, errors="coerce")
 
 def as_int_or_nan(x):
     if is_missing_like(x):
@@ -44,8 +46,7 @@ def is_false_like(value):
     if isinstance(value, (int, float)):
         return int(value) == 0
     if isinstance(value, str):
-        v = value.strip().lower()
-        return v in {"false", "no", "0"}
+        return value.strip().lower() in {"false", "no", "0"}
     return False
 
 def round_half_up_days(days_float):
@@ -64,17 +65,130 @@ def split_city_state(value):
         return parts[0].strip(), parts[1].strip()
     return txt.strip(), ""
 
-def compute_in_transit_time_row(row):
-    tracked_val = row.get("Tracked", np.nan)
-    milestones_received = row.get("Nb Milestones Received", np.nan)
+# ---------------------------------------------
+# Robust loader (CSV or Excel; various encodings/delimiters)
+# ---------------------------------------------
+def load_table(uploaded_file) -> pd.DataFrame:
+    raw = uploaded_file.read()  # bytes
+    name = (uploaded_file.name or "").lower()
 
-    milestones_i = as_int_or_nan(milestones_received)
-    untracked_condition = is_false_like(tracked_val) or (pd.isna(milestones_i) or milestones_i == 0)
-    if untracked_condition:
+    # Excel?
+    if name.endswith((".xlsx", ".xls")) or raw[:2] == b"PK":
+        try:
+            return pd.read_excel(io.BytesIO(raw))
+        except Exception:
+            pass
+
+    # Try CSV with multiple encodings + auto delimiter
+    encodings = ["utf-8", "utf-8-sig", "cp1252", "latin-1", "utf-16", "utf-16-le", "utf-16-be"]
+    for enc in encodings:
+        try:
+            return pd.read_csv(io.BytesIO(raw), encoding=enc, sep=None, engine="python", on_bad_lines="skip")
+        except Exception:
+            continue
+
+    # As a last resort, try Excel again
+    return pd.read_excel(io.BytesIO(raw))
+
+# ---------------------------------------------
+# RAW → Data (select, rename, derive)
+# ---------------------------------------------
+DATA_COLUMNS_ORDER = [
+    "Carrier Name",
+    "Bill of Lading",
+    "Tracked",
+    "Pickup Name",
+    "Pickup City State",
+    "Pickup Country",
+    "Dropoff Name",
+    "Dropoff City State",
+    "Dropoff Country",
+    "Final Status Reason",
+    "Pickup Arrival Utc Timestamp Raw",
+    "Pickup Departure Utc Timestamp Raw",
+    "Dropoff Arrival Utc Timestamp Raw",
+    "Dropoff Departure Utc Timestamp Raw",
+    "Nb Milestones Expected",
+    "Nb Milestones Received",
+    "Milestones Achieved Percentage",
+    "Latency Updates Received",
+    "Latency Updates Passed",
+    "Shipment Latency Percentage",
+    "Average Latency (min)",
+]
+
+def parse_received_expected(series_ratio: pd.Series) -> Tuple[pd.Series, pd.Series]:
+    """
+    Extract 'received' and 'expected' from strings like '3 / 10'.
+    Returns numeric Series (float) with NaN on failure.
+    """
+    s = series_ratio.astype(str)
+    m = s.str.extract(r"(-?\d+)\s*/\s*(-?\d+)")
+    received = pd.to_numeric(m[0], errors="coerce")
+    expected = pd.to_numeric(m[1], errors="coerce")
+    return received, expected
+
+def build_data_from_raw(df_raw: pd.DataFrame) -> pd.DataFrame:
+    df = normalize_headers(df_raw)
+    n = len(df)
+
+    def col(name):
+        return df.get(name, pd.Series([np.nan] * n))
+
+    # Parse milestones received/expected from the ratio column
+    rec, exp = parse_received_expected(col("# Of Milestones received / # Of Milestones expected"))
+
+    # Shipment latency % from updates within 10 mins vs total updates
+    updates_total = pd.to_numeric(col("# Updates Received"), errors="coerce")
+    updates_passed = pd.to_numeric(col("# Updates Received < 10 mins"), errors="coerce")
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        milestones_pct = (rec / exp) * 100.0
+        ship_latency_pct = (updates_passed / updates_total) * 100.0
+
+    data = pd.DataFrame({
+        "Carrier Name": col("Carrier Name"),
+        "Bill of Lading": col("Bill of Lading"),
+        "Tracked": col("Tracked"),
+        "Pickup Name": col("Pickup Name"),
+        "Pickup City State": col("Pickup City State"),
+        "Pickup Country": col("Pickup Country"),
+        "Dropoff Name": col("Final Destination Name"),
+        "Dropoff City State": col("Final Destination City State"),
+        "Dropoff Country": col("Final Destination Country"),
+        "Final Status Reason": col("Final Status Reason"),
+        "Pickup Arrival Utc Timestamp Raw": col("Pickup Arrival Milestone (UTC)"),
+        "Pickup Departure Utc Timestamp Raw": col("Pickup Departure Milestone (UTC)"),
+        "Dropoff Arrival Utc Timestamp Raw": col("Final Destination Arrival Milestone (UTC)"),
+        "Dropoff Departure Utc Timestamp Raw": col("Final Destination Departure Milestone (UTC)"),
+        "Nb Milestones Expected": exp,
+        "Nb Milestones Received": rec,
+        "Milestones Achieved Percentage": milestones_pct,
+        "Latency Updates Received": updates_total,
+        "Latency Updates Passed": updates_passed,
+        "Shipment Latency Percentage": ship_latency_pct,
+        "Average Latency (min)": pd.to_numeric(col("Average Latency (min)"), errors="coerce"),
+    })
+
+    # Reorder to exact A..U order
+    data = data[DATA_COLUMNS_ORDER]
+
+    return data
+
+# ---------------------------------------------
+# V column logic + Summary
+# ---------------------------------------------
+def compute_in_transit_time_row(row):
+    # Untracked rule
+    tracked_val = row.get("Tracked", np.nan)
+    nb_recv = row.get("Nb Milestones Received", np.nan)
+    milestones_i = as_int_or_nan(nb_recv)
+    if is_false_like(tracked_val) or (pd.isna(milestones_i) or milestones_i == 0):
         return "Untracked"
 
-    pick_dep = parse_timestamp(row.get("Pickup Departure Utc Timestamp Raw", np.nan))
-    drop_arr = parse_timestamp(row.get("Dropoff Arrival Utc Timestamp Raw", np.nan))
+    # Compute days = Dropoff Arrival - Pickup Departure
+    pick_dep = parse_timestamp(row.get("Pickup Departure Utc Timestamp Raw"))
+    drop_arr = parse_timestamp(row.get("Dropoff Arrival Utc Timestamp Raw"))
     if pd.isna(pick_dep) or pd.isna(drop_arr):
         return "Missing Milestone"
 
@@ -84,64 +198,10 @@ def compute_in_transit_time_row(row):
 
     return int(round_half_up_days(delta_days))
 
-# ---------- NEW: robust file loader ----------
-def load_table(uploaded_file: "streamlit.UploadedFile") -> pd.DataFrame:
-    """
-    Robustly load CSV or Excel:
-    - Detect Excel by extension or ZIP signature.
-    - Try multiple encodings and delimiters for CSV.
-    - Skip malformed lines instead of failing.
-    """
-    raw = uploaded_file.read()  # bytes
-    name = (uploaded_file.name or "").lower()
-
-    # If it's clearly Excel (by extension or ZIP signature)
-    if name.endswith((".xlsx", ".xls")) or raw[:2] == b"PK":
-        try:
-            return pd.read_excel(io.BytesIO(raw))
-        except Exception as e:
-            # Fall through to CSV attempts if Excel parse fails
-            pass
-
-    # Heuristic: assemble encodings to try (BOM-aware)
-    if raw.startswith(codecs.BOM_UTF16_LE) or raw.startswith(codecs.BOM_UTF16_BE):
-        encodings = ["utf-16", "utf-16-le", "utf-16-be", "utf-8-sig", "utf-8", "cp1252", "latin-1"]
-    else:
-        encodings = ["utf-8", "utf-8-sig", "cp1252", "latin-1", "utf-16", "utf-16-le", "utf-16-be"]
-
-    # Primary attempt: sep=None (python engine) to sniff delimiter, skip bad lines
-    for enc in encodings:
-        try:
-            return pd.read_csv(io.BytesIO(raw), encoding=enc, sep=None, engine="python", on_bad_lines="skip")
-        except Exception:
-            continue
-
-    # Secondary: explicitly try tab
-    for enc in encodings:
-        try:
-            return pd.read_csv(io.BytesIO(raw), encoding=enc, sep="\t", engine="python", on_bad_lines="skip")
-        except Exception:
-            continue
-
-    # Last resort: try Excel again (some CSVs are actually XLSX bytes but renamed)
-    try:
-        return pd.read_excel(io.BytesIO(raw))
-    except Exception as e:
-        # Re-raise with helpful message for Streamlit
-        raise RuntimeError(
-            "Unable to parse the uploaded file as CSV or Excel. "
-            "Please ensure it's a valid CSV (comma/semicolon/tab) or an .xlsx file."
-        ) from e
-
-def normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
-    # Strip and collapse internal whitespace in headers
-    df = df.copy()
-    df.columns = [re.sub(r"\s+", " ", str(c).strip()) for c in df.columns]
-    return df
-
 def build_summary_sheet(df_data):
     v = df_data["In-Transit Time"]
     is_numeric_v = pd.to_numeric(v, errors="coerce").notna()
+
     count_tracked = int(is_numeric_v.sum())
     count_missing = int((v == "Missing Milestone").sum())
     count_untracked = int((v == "Untracked").sum())
@@ -152,22 +212,24 @@ def build_summary_sheet(df_data):
 
     df_numeric = df_data[is_numeric_v].copy()
 
-    pick_city, pick_state = zip(*df_numeric.get("Pickup City State", pd.Series([], dtype=object)).map(split_city_state)) if len(df_numeric) else ([], [])
-    drop_city, drop_state = zip(*df_numeric.get("Dropoff City State", pd.Series([], dtype=object)).map(split_city_state)) if len(df_numeric) else ([], [])
+    # Split city/state for main table
+    pick_city, pick_state = zip(*df_numeric["Pickup City State"].map(split_city_state)) if len(df_numeric) else ([], [])
+    drop_city, drop_state = zip(*df_numeric["Dropoff City State"].map(split_city_state)) if len(df_numeric) else ([], [])
 
     summary_main = pd.DataFrame({
-        "Bill of Lading": df_numeric.get("Bill of Lading", pd.Series(dtype=str)).astype(str),
-        "Pickup Name": df_numeric.get("Pickup Name", pd.Series(dtype=str)).astype(str),
+        "Bill of Lading": df_numeric["Bill of Lading"].astype(str),
+        "Pickup Name": df_numeric["Pickup Name"].astype(str),
         "Pickup City": list(pick_city),
         "Pickup State": list(pick_state),
-        "Pickup Country": df_numeric.get("Pickup Country", pd.Series(dtype=str)).astype(str),
-        "Dropoff Name": df_numeric.get("Dropoff Name", pd.Series(dtype=str)).astype(str),
+        "Pickup Country": df_numeric["Pickup Country"].astype(str),
+        "Dropoff Name": df_numeric["Dropoff Name"].astype(str),
         "Dropoff City": list(drop_city),
         "Dropoff State": list(drop_state),
-        "Dropoff Country": df_numeric.get("Dropoff Country", pd.Series(dtype=str)).astype(str),
-        "Average of In-Transit Time": pd.to_numeric(df_numeric.get("In-Transit Time"), errors="coerce").astype("Int64"),
+        "Dropoff Country": df_numeric["Dropoff Country"].astype(str),
+        "Average of In-Transit Time": pd.to_numeric(df_numeric["In-Transit Time"], errors="coerce").astype("Int64"),
     })
 
+    # Small top table (we’ll place it in Excel with formatting)
     small_table = pd.DataFrame({
         "Label": ["Tracked", "Missed Milestone", "Untracked", "Grand Total"],
         "Shipment Count": [count_tracked, count_missing, count_untracked, grand_total],
@@ -175,53 +237,49 @@ def build_summary_sheet(df_data):
         "Time taken from Departure to Arrival": [np.nan, np.nan, np.nan, avg_days_all],
     })
 
-    return summary_main, small_table, {
-        "count_tracked": count_tracked,
-        "count_missing": count_missing,
-        "count_untracked": count_untracked,
-        "grand_total": grand_total,
-        "avg_days_all": avg_days_all,
-    }
+    return summary_main, small_table
 
+# ---------------------------------------------
+# Excel writer with styling
+# ---------------------------------------------
 def write_excel_with_formatting(df_data, summary_main, small_table):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        # ---- Data sheet (ONLY the selected columns + V) ----
         df_data.to_excel(writer, sheet_name="Data", index=False)
 
         wb = writer.book
         ws = wb.add_worksheet("Summary")
 
-        fmt_header_blue_bold = wb.add_format({"bold": True, "bg_color": "#D9EDF7", "border": 1})
+        fmt_header = wb.add_format({"bold": True, "bg_color": "#D9EDF7", "border": 1})
         fmt_bold = wb.add_format({"bold": True})
         fmt_border = wb.add_format({"border": 1})
-        fmt_blue_bold_border = wb.add_format({"bold": True, "bg_color": "#D9EDF7", "border": 1})
+        fmt_blue_bold_border = fmt_header
 
+        # Column widths (Summary)
         ws.set_column("A:A", 22)
         ws.set_column("B:B", 18)
-        ws.set_column("C:C", 2)
+        ws.set_column("C:C", 2)   # blank separator
         ws.set_column("D:D", 28)
         ws.set_column("E:E", 34)
 
-        # Small table headers
-        ws.write(0, 0, "Label", fmt_blue_bold_border)
-        ws.write(0, 1, "Shipment Count", fmt_blue_bold_border)
-        ws.write(0, 2, "", fmt_border)
-        ws.write(0, 3, "Average of In-Transit Time", fmt_blue_bold_border)
-        ws.write(0, 4, "Time taken from Departure to Arrival", fmt_border)
+        # ---- Small table rows 1–5 ----
+        ws.write(0, 0, "Label", fmt_blue_bold_border)                 # A1
+        ws.write(0, 1, "Shipment Count", fmt_blue_bold_border)        # B1
+        ws.write(0, 2, "", fmt_border)                                # C1 blank
+        ws.write(0, 3, "Average of In-Transit Time", fmt_blue_bold_border)  # D1
+        ws.write(0, 4, "Time taken from Departure to Arrival", fmt_border)   # E1
 
-        # Labels A2..A4 + Grand Total A5
         ws.write(1, 0, "Tracked")
         ws.write(2, 0, "Missed Milestone")
         ws.write(3, 0, "Untracked")
         ws.write(4, 0, "Grand Total", fmt_blue_bold_border)
 
-        # Counts B2..B5
         ws.write_number(1, 1, int(small_table.loc[0, "Shipment Count"]))
         ws.write_number(2, 1, int(small_table.loc[1, "Shipment Count"]))
         ws.write_number(3, 1, int(small_table.loc[2, "Shipment Count"]))
         ws.write_number(4, 1, int(small_table.loc[3, "Shipment Count"]))
 
-        # D5/E5 averages
         avg_days_all = small_table.loc[3, "Average of In-Transit Time (days)"]
         if pd.notna(avg_days_all):
             ws.write_number(4, 3, float(avg_days_all))
@@ -230,28 +288,26 @@ def write_excel_with_formatting(df_data, summary_main, small_table):
             ws.write(4, 3, "")
             ws.write(4, 4, "")
 
-        # Add borders to the small area
         for r in range(1, 5):
             for c in range(0, 5):
                 ws.write_blank(r, c, None, fmt_border)
 
-        # Main table headers (row 7)
+        # ---- Main table starting row 7 ----
         start_row = 6
         headers = [
             "Bill of Lading", "Pickup Name", "Pickup City", "Pickup State", "Pickup Country",
             "Dropoff Name", "Dropoff City", "Dropoff State", "Dropoff Country",
             "Average of In-Transit Time"
         ]
-        for col_idx, h in enumerate(headers):
-            ws.write(start_row, col_idx, h, fmt_blue_bold_border)
+        for c, h in enumerate(headers):
+            ws.write(start_row, c, h, fmt_blue_bold_border)
 
-        # Main table data
         for i, (_, row) in enumerate(summary_main.iterrows(), start=1):
             r = start_row + i
             for c_idx, col_name in enumerate(headers):
                 val = row[col_name]
                 if col_name == "Bill of Lading":
-                    ws.write(r, c_idx, "" if pd.isna(val) else str(val), wb.add_format({"bold": True}))
+                    ws.write(r, c_idx, "" if pd.isna(val) else str(val), fmt_bold)
                 elif col_name == "Average of In-Transit Time":
                     if pd.isna(val):
                         ws.write(r, c_idx, "")
@@ -263,7 +319,6 @@ def write_excel_with_formatting(df_data, summary_main, small_table):
                 else:
                     ws.write(r, c_idx, "" if pd.isna(val) else str(val))
 
-        # Grand Total row at the end
         last_data_row = start_row + len(summary_main) + 1
         ws.write(last_data_row, 0, "Grand Total", fmt_blue_bold_border)
         if len(summary_main) > 0:
@@ -273,78 +328,69 @@ def write_excel_with_formatting(df_data, summary_main, small_table):
         else:
             ws.write(last_data_row, 9, "", fmt_blue_bold_border)
 
-        # Autosize Data sheet columns
-        ws_data = writer.sheets["Data"]
-        for idx, col in enumerate(df_data.columns):
-            width = min(50, max(12, int(df_data[col].astype(str).str.len().quantile(0.9)) + 2))
-            ws_data.set_column(idx, idx, width)
+        # Autosize Data sheet
+        ws_data = writer.sheets.get("Data")
+        if ws_data:
+            for idx, col in enumerate(df_data.columns):
+                width = min(50, max(12, int(df_data[col].astype(str).str.len().quantile(0.9)) + 2))
+                ws_data.set_column(idx, idx, width)
 
     output.seek(0)
     return output
 
-# ---------- UPDATED: process any uploaded file ----------
-def process_uploaded_file(uploaded_file, selected_mode="FTL"):
-    df = load_table(uploaded_file)
-    df = normalize_headers(df)
-
-    # Expected headers (we proceed even if some are missing)
-    required_cols = [
-        "Carrier Name", "Bill of Lading", "Tracked", "Pickup Name", "Pickup City State", "Pickup Country",
-        "Dropoff Name", "Dropoff City State", "Dropoff Country", "Final Status Reason",
-        "Pickup Arrival Utc Timestamp Raw", "Pickup Departure Utc Timestamp Raw",
-        "Dropoff Arrival Utc Timestamp Raw", "Dropoff Departure Utc Timestamp Raw",
-        "Nb Milestones Expected", "Nb Milestones Received", "Milestones Achieved Percentage",
-        "Latency Updates Received", "Latency Updates Passed", "Shipment Latency Percentage",
-        "Average Latency (min)"
-    ]
-    missing = [c for c in required_cols if c not in df.columns]
-    if missing:
-        st.warning(f"Missing expected columns (continuing anyway): {missing}")
-
-    df["In-Transit Time"] = df.apply(compute_in_transit_time_row, axis=1)
-
-    summary_main, small_table, stats = build_summary_sheet(df)
-    excel_bytes = write_excel_with_formatting(df, summary_main, small_table)
-    return df, summary_main, excel_bytes
-
 # ---------------------------------------------
-# Streamlit UI
+# Streamlit workflow
 # ---------------------------------------------
 st.set_page_config(page_title="FTL In-Transit Builder", page_icon="🚚", layout="wide")
-st.title("Integris Report")
+st.title("FTL In-Transit Time Processor (RAW → Data → Summary)")
 
-col_mode, col_info = st.columns([1, 3])
-with col_mode:
-    mode = st.selectbox("Mode", options=["FTL"], index=0, help="More modes (Ocean, Air, Parcel, LTL) coming next.")
-with col_info:
-    st.caption("Upload CSV or Excel. Rounding: `< .5` down, `≥ .5` up. City/State split on first hyphen with trimming.")
+mode_col, info_col = st.columns([1, 3])
+with mode_col:
+    mode = st.selectbox("Mode", options=["FTL"], index=0)
+with info_col:
+    st.caption("Upload your raw CSV or Excel. We build the Data sheet with your exact columns, add column V "
+               "In-Transit Time (round: <.5 down, ≥.5 up), then generate the Summary sheet.")
 
-uploaded = st.file_uploader("Upload CSV or Excel", type=["csv", "xlsx", "xls"])
+uploaded = st.file_uploader("Upload RAW CSV or Excel", type=["csv", "xlsx", "xls"])
 
 if uploaded is not None:
     try:
-        df_data, summary_main, excel_bytes = process_uploaded_file(uploaded, selected_mode=mode)
-        st.success("Processing complete.")
+        df_raw = load_table(uploaded)
+        df_data = build_data_from_raw(df_raw)
 
-        with st.expander("Preview: Data (with In-Transit Time)"):
+        # Compute V on the Data sheet
+        df_data["In-Transit Time"] = df_data.apply(compute_in_transit_time_row, axis=1)
+
+        # Summary
+        summary_main, small_table = build_summary_sheet(df_data)
+
+        # Full Excel (Data + Summary)
+        excel_bytes = write_excel_with_formatting(df_data, summary_main, small_table)
+
+        st.success("Processed! Preview below and use the download buttons.")
+
+        with st.expander("Preview: Data (A..U + V)"):
             st.dataframe(df_data.head(50))
         with st.expander("Preview: Summary main table"):
             st.dataframe(summary_main.head(50))
 
+        # Downloads
         data_csv = df_data.to_csv(index=False).encode("utf-8")
         summary_csv = summary_main.to_csv(index=False).encode("utf-8")
 
-        dl_col1, dl_col2 = st.columns(2)
-        with dl_col1:
-            st.download_button("⬇️ Download Data (CSV)", data=data_csv, file_name="Data_FTL.csv", mime="text/csv", use_container_width=True)
+        c1, c2 = st.columns(2)
+        with c1:
+            st.download_button("⬇️ Download Data (CSV)", data=data_csv, file_name="Data_FTL.csv",
+                               mime="text/csv", use_container_width=True)
             st.download_button("⬇️ Download Data (Excel)", data=excel_bytes, file_name="Data_and_Summary_FTL.xlsx",
                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
-        with dl_col2:
-            st.download_button("⬇️ Download Summary (CSV)", data=summary_csv, file_name="Summary_FTL.csv", mime="text/csv", use_container_width=True)
+        with c2:
+            st.download_button("⬇️ Download Summary (CSV)", data=summary_csv, file_name="Summary_FTL.csv",
+                               mime="text/csv", use_container_width=True)
             st.download_button("⬇️ Download Full Excel (Data + Summary)", data=excel_bytes, file_name="Data_and_Summary_FTL.xlsx",
                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
 
     except Exception as e:
-        st.error(f"Sorry—couldn’t parse this file as CSV or Excel. Details: {e}")
+        st.error(f"Could not process this file. Details: {e}")
 else:
-    st.info("Please upload your raw CSV or Excel to begin.")
+    st.info("Upload your raw file to begin.")
