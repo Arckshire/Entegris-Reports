@@ -80,13 +80,18 @@ def round_half_up_days(x):
     return math.floor(x + 0.5)  # 3.5->4, 3.4->3
 
 def split_city_state(text: str):
-    """Preferred: split on first '-' (city - state). Else try last 2-letter uppercase token as state.
-       Returns (city, state)."""
+    """
+    Preferred: split on first '-' (city - state).
+    Else try last 2-letter uppercase token as state.
+    Returns (city, state). If not present, leaves city with full string and state blank.
+    """
     if is_missing_like(text): return "", ""
     s = str(text).strip()
+
     parts = re.split(r"\s*-\s*", s, maxsplit=1)
     if len(parts) == 2:
         return parts[0].strip(), parts[1].strip()
+
     m = re.match(r"^(.*?)[\s,]+([A-Z]{2})$", s)
     if m:
         return m.group(1).strip(), m.group(2).strip()
@@ -95,10 +100,6 @@ def split_city_state(text: str):
 # -----------------------------
 # Mode configs (columns & E1 text)
 # -----------------------------
-# For each mode, we specify:
-# - the minimal columns we need to build Summary
-# - which timestamps to use for transit
-# - what E1 explanatory text should say
 MODE_CONFIG = {
     "FTL": {
         "columns": {
@@ -120,26 +121,39 @@ MODE_CONFIG = {
             "bol": "Bill of Lading",
             "tracked": "Tracked",
             "p_name": "Pickup Name",
-            "p_city_state": "Pickup City State",
+            "p_city_state": "Pickup City State",     # if missing in your LTL dump, will be blank
             "p_country": "Pickup Country",
             "d_name": "Destination Name",
-            "d_city_state": "Dropoff City State",
+            "d_city_state": "Dropoff City State",    # if missing, will be blank
             "d_country": "Dropoff Country",
-            "start_ts": "Pickup Utc Timestamp Time",                     # Pickup time
-            "end_ts":   "Delivered Utc Timestamp Time",                  # Delivered time
+            "start_ts": "Pickup Utc Timestamp Time",
+            "end_ts":   "Delivered Utc Timestamp Time",
         },
         "e1_text": "Time taken from Pickup to Delivered",
     },
-    # Until you provide exact mappings for these, we default to FTL’s mapping.
+    "Parcel": {
+        "columns": {
+            "bol": "Bill of Lading",
+            "tracked": "Tracked",
+            "p_name": "Pickup Name",
+            "p_city_state": "Pickup City State",        # Parcel dump doesn't include this; will be blank
+            "p_country": "Pickup Country",
+            "d_name": "Destination Name",
+            "d_city_state": "Dropoff City State",       # Parcel dump doesn't include this; will be blank
+            "d_country": "Dropoff Country",
+            "start_ts": "Departed Utc Timestamp Time",
+            "end_ts":   "Delivered Utc Timestamp Time",
+        },
+        "e1_text": "Time taken from Departed to Delivered",
+    },
+    # Placeholders (reuse FTL mapping until you share)
     "Ocean": {"columns": None, "e1_text": "Time taken from Departure to Arrival"},
     "Air":   {"columns": None, "e1_text": "Time taken from Departure to Arrival"},
-    "Parcel":{"columns": None, "e1_text": "Time taken from Departure to Arrival"},
 }
 
 def columns_for_mode(mode: str):
     cfg = MODE_CONFIG.get(mode, MODE_CONFIG["FTL"]).copy()
     if cfg["columns"] is None:
-        # inherit FTL until provided
         cfg["columns"] = MODE_CONFIG["FTL"]["columns"]
     return cfg
 
@@ -186,9 +200,9 @@ def build_summary_tables(df_raw: pd.DataFrame, mode: str):
     C = cfg["columns"]
 
     # Ensure needed columns exist
-    need = [C["bol"], C["tracked"], C["p_name"], C["p_city_state"], C["p_country"],
-            C["d_name"], C["d_city_state"], C["d_country"], C["start_ts"], C["end_ts"]]
-    for col in need:
+    required = [C["bol"], C["tracked"], C["p_name"], C["p_city_state"], C["p_country"],
+                C["d_name"], C["d_city_state"], C["d_country"], C["start_ts"], C["end_ts"]]
+    for col in required:
         if col not in df.columns:
             df[col] = np.nan
 
@@ -201,10 +215,9 @@ def build_summary_tables(df_raw: pd.DataFrame, mode: str):
     dep_ts = dep.apply(parse_timestamp_utc)
     arr_ts = arr.apply(parse_timestamp_utc)
 
-    # Compute transit days (raw float)
+    # Compute transit days (raw float) & rounded days
     delta_days = (arr_ts - dep_ts).dt.total_seconds() / (24 * 3600)
     valid_transit = delta_days > 0
-    # Rounded days
     in_transit_days = delta_days.apply(lambda x: int(round_half_up_days(x)) if pd.notna(x) else np.nan)
 
     # Categories (mutually exclusive)
@@ -227,32 +240,30 @@ def build_summary_tables(df_raw: pd.DataFrame, mode: str):
         "Label": ["Tracked", "Missed Milestone", "Untracked", "Grand Total"],
         "Shipment Count": [cnt_tracked, cnt_missing, cnt_untracked, grand_total],
         "": ["", "", "", ""],  # blank col (row 1 col C)
-        "Average of In-Transit Time": ["", "", "", avg_tracked],       # row 1 col D header stays same
-        "Time taken from ...": ["", "", "", ""],                       # row 1 col E header customized below
+        "Average of In-Transit Time": ["", "", "", avg_tracked],
+        cfg["e1_text"]: ["", "", "", ""],  # customized E1 header
     })
-    # Rename E1 per mode
-    small.columns = ["Label", "Shipment Count", "", "Average of In-Transit Time", cfg["e1_text"]]
 
     # Main table (only rows with numeric in-transit days = tracked_good)
     rows = df[is_tracked_good].copy()
 
-    def cs(series): return series.astype(str)
-    p_city, p_state = ([], [])
-    d_city, d_state = ([], [])
+    def as_str(s): return rows[s].astype(str) if s in rows.columns else pd.Series([""] * len(rows))
+    p_city, p_state = [], []
+    d_city, d_state = [], []
     if len(rows):
-        p_city, p_state = zip(*cs(rows[C["p_city_state"]]).map(split_city_state))
-        d_city, d_state = zip(*cs(rows[C["d_city_state"]]).map(split_city_state))
+        p_city, p_state = zip(*as_str(C["p_city_state"]).map(split_city_state)) if C["p_city_state"] in rows.columns else ([], [])
+        d_city, d_state = zip(*as_str(C["d_city_state"]).map(split_city_state)) if C["d_city_state"] in rows.columns else ([], [])
 
     main = pd.DataFrame({
-        "Bill of Lading": rows[C["bol"]].astype(str).str.strip(),
-        "Pickup Name": rows[C["p_name"]].astype(str).str.strip(),
-        "Pickup City": list(p_city),
-        "Pickup State": list(p_state),
-        "Pickup Country": rows[C["p_country"]].astype(str).str.strip(),
-        "Dropoff Name": rows[C["d_name"]].astype(str).str.strip(),
-        "Dropoff City": list(d_city),
-        "Dropoff State": list(d_state),
-        "Dropoff Country": rows[C["d_country"]].astype(str).str.strip(),
+        "Bill of Lading": as_str(C["bol"]).str.strip(),
+        "Pickup Name": as_str(C["p_name"]).str.strip(),
+        "Pickup City": list(p_city) if p_city else [""] * len(rows),
+        "Pickup State": list(p_state) if p_state else [""] * len(rows),
+        "Pickup Country": as_str(C["p_country"]).str.strip(),
+        "Dropoff Name": as_str(C["d_name"]).str.strip(),
+        "Dropoff City": list(d_city) if d_city else [""] * len(rows),
+        "Dropoff State": list(d_state) if d_state else [""] * len(rows),
+        "Dropoff Country": as_str(C["d_country"]).str.strip(),
         "Average of In-Transit Time": tracked_days[is_tracked_good].astype("Int64"),
     })
 
@@ -296,8 +307,12 @@ def build_summary_single_csv(small_df: pd.DataFrame, main_df: pd.DataFrame) -> b
 # -----------------------------
 # UI
 # -----------------------------
-mode = st.selectbox("Mode", options=list(MODE_CONFIG.keys()), index=0,
-                    help="FTL and LTL have exact mappings. Others currently reuse FTL until you provide their columns.")
+mode = st.selectbox(
+    "Mode",
+    options=list(MODE_CONFIG.keys()),
+    index=0,
+    help="FTL, LTL, and Parcel have exact mappings. Ocean/Air reuse FTL until you provide their columns."
+)
 uploaded = st.file_uploader("Upload RAW file (CSV or Excel)", type=["csv", "xlsx", "xls"], accept_multiple_files=False)
 st.caption(f"Selected mode: **{mode}**")
 
