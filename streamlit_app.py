@@ -7,15 +7,15 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# -----------------------------
+# -----------------------------------
 # App meta
-# -----------------------------
+# -----------------------------------
 st.set_page_config(page_title="Entegris Reports", page_icon="📦", layout="wide")
 st.title("Entegris Reports — Summary Builder (Tracked / Missed / Untracked)")
 
-# -----------------------------
-# Dependency helper for Excel
-# -----------------------------
+# -----------------------------------
+# Dependency helper (Excel engines)
+# -----------------------------------
 def _ensure_pkg(pkg_name, spec=None) -> bool:
     try:
         __import__(pkg_name); return True
@@ -34,9 +34,9 @@ def pick_xlsx_engine() -> str:
     if _ensure_pkg("openpyxl",  "openpyxl>=3.1.5"):    return "openpyxl"
     return ""  # neither available
 
-# -----------------------------
+# -----------------------------------
 # Parsing helpers
-# -----------------------------
+# -----------------------------------
 def normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     keep = []
@@ -57,18 +57,14 @@ def is_true_like(v):
     if isinstance(v, bool): return v is True
     if is_missing_like(v):  return False
     if isinstance(v, (int, float)): return int(v) == 1
-    if isinstance(v, str):
-        s = v.strip().lower()
-        return s in {"true", "yes", "y", "1"}
+    if isinstance(v, str):  return v.strip().lower() in {"true","yes","y","1"}
     return False
 
 def is_false_like(v):
     if isinstance(v, bool): return v is False
     if is_missing_like(v):  return False
     if isinstance(v, (int, float)): return int(v) == 0
-    if isinstance(v, str):
-        s = v.strip().lower()
-        return s in {"false", "no", "n", "0"}
+    if isinstance(v, str):  return v.strip().lower() in {"false","no","n","0"}
     return False
 
 def parse_timestamp_utc(s):
@@ -80,27 +76,20 @@ def round_half_up_days(x):
     return math.floor(x + 0.5)  # 3.5->4, 3.4->3
 
 def split_city_state(text: str):
-    """
-    Preferred: split on first '-' (city - state).
-    Else try last 2-letter uppercase token as state.
-    Returns (city, state). If not present, leaves city with full string and state blank.
-    """
+    """Preferred: split on first '-' (city - state). Else try last 2-letter uppercase token."""
     if is_missing_like(text): return "", ""
     s = str(text).strip()
-
     parts = re.split(r"\s*-\s*", s, maxsplit=1)
-    if len(parts) == 2:
-        return parts[0].strip(), parts[1].strip()
-
+    if len(parts) == 2: return parts[0].strip(), parts[1].strip()
     m = re.match(r"^(.*?)[\s,]+([A-Z]{2})$", s)
-    if m:
-        return m.group(1).strip(), m.group(2).strip()
+    if m: return m.group(1).strip(), m.group(2).strip()
     return s, ""
 
-# -----------------------------
+# -----------------------------------
 # Mode configs (columns & E1 text)
-# -----------------------------
+# -----------------------------------
 MODE_CONFIG = {
+    # FTL (Truckload)
     "FTL": {
         "columns": {
             "bol": "Bill of Lading",
@@ -111,55 +100,93 @@ MODE_CONFIG = {
             "d_name": "Final Destination Name",
             "d_city_state": "Final Destination City State",
             "d_country": "Final Destination Country",
-            "start_ts": "Pickup Departure Milestone (UTC)",              # AA
-            "end_ts":   "Final Destination Arrival Milestone (UTC)",     # AB
+            "start_ts": "Pickup Departure Milestone (UTC)",          # AA
+            "end_ts":   "Final Destination Arrival Milestone (UTC)", # AB
         },
         "e1_text": "Time taken from Departure to Arrival",
+        "classification": "tracked_boolean",
+        "main_first_col_header": "Bill of Lading",
     },
+
+    # LTL
     "LTL": {
         "columns": {
             "bol": "Bill of Lading",
             "tracked": "Tracked",
             "p_name": "Pickup Name",
-            "p_city_state": "Pickup City State",     # if missing in your LTL dump, will be blank
+            "p_city_state": "Pickup City State",    # if missing will be blank
             "p_country": "Pickup Country",
             "d_name": "Destination Name",
-            "d_city_state": "Dropoff City State",    # if missing, will be blank
+            "d_city_state": "Dropoff City State",   # if missing will be blank
             "d_country": "Dropoff Country",
             "start_ts": "Pickup Utc Timestamp Time",
             "end_ts":   "Delivered Utc Timestamp Time",
         },
         "e1_text": "Time taken from Pickup to Delivered",
+        "classification": "tracked_boolean",
+        "main_first_col_header": "Bill of Lading",
     },
+
+    # Parcel
     "Parcel": {
         "columns": {
             "bol": "Bill of Lading",
             "tracked": "Tracked",
             "p_name": "Pickup Name",
-            "p_city_state": "Pickup City State",        # Parcel dump doesn't include this; will be blank
+            "p_city_state": "Pickup City State",      # may not exist; blank ok
             "p_country": "Pickup Country",
             "d_name": "Destination Name",
-            "d_city_state": "Dropoff City State",       # Parcel dump doesn't include this; will be blank
+            "d_city_state": "Dropoff City State",     # may not exist; blank ok
             "d_country": "Dropoff Country",
             "start_ts": "Departed Utc Timestamp Time",
             "end_ts":   "Delivered Utc Timestamp Time",
         },
         "e1_text": "Time taken from Departed to Delivered",
+        "classification": "tracked_boolean",
+        "main_first_col_header": "Bill of Lading",
     },
-    # Placeholders (reuse FTL mapping until you share)
-    "Ocean": {"columns": None, "e1_text": "Time taken from Departure to Arrival"},
-    "Air":   {"columns": None, "e1_text": "Time taken from Departure to Arrival"},
+
+    # Ocean
+    "Ocean": {
+        "columns": {
+            # Display "Container Number" in main table (fallback to Shipment ID if empty)
+            "bol": "Container Number",
+            "tracked": None,  # not used in ocean classification
+            "p_name": "Pol",
+            "p_city_state": None,
+            "p_country": None,
+            "d_name": "Pod",
+            "d_city_state": None,
+            "d_country": None,
+            "start_ts": "2-Gate In Timestamp",     # U
+            "end_ts":   "7-Gate Out Timestamp",    # AB
+            "miss_flags": [
+                "1-Empty Pickup Missed",
+                "2-Gate In Missed",
+                "3-Container Loaded POL Missed",
+                "4-Vessel Departure POL Missed",
+                "5-Vessel Arrival POD Missed",
+                "6-Container Discharge POD Missed",
+                "7-Gate Out Missed",
+                "8-Empty Return Missed",
+            ],
+            "fallback_bol": "Shipment ID",
+        },
+        "e1_text": "Time taken from Gate In to Gate Out",
+        "classification": "ocean_rules",
+        "main_first_col_header": "Container Number",
+    },
 }
 
 def columns_for_mode(mode: str):
     cfg = MODE_CONFIG.get(mode, MODE_CONFIG["FTL"]).copy()
-    if cfg["columns"] is None:
-        cfg["columns"] = MODE_CONFIG["FTL"]["columns"]
+    if "classification" not in cfg:
+        cfg["classification"] = "tracked_boolean"
     return cfg
 
-# -----------------------------
+# -----------------------------------
 # Loader (CSV or Excel)
-# -----------------------------
+# -----------------------------------
 def load_table(uploaded_file) -> pd.DataFrame:
     raw_bytes = uploaded_file.read()
     name = (uploaded_file.name or "").lower()
@@ -191,42 +218,60 @@ def load_table(uploaded_file) -> pd.DataFrame:
     _ensure_pkg("openpyxl", "openpyxl>=3.1.5")
     return pd.read_excel(io.BytesIO(raw_bytes))
 
-# -----------------------------
+# -----------------------------------
 # Core builder: Summary only
-# -----------------------------
+# -----------------------------------
 def build_summary_tables(df_raw: pd.DataFrame, mode: str):
     df = normalize_headers(df_raw).copy()
     cfg = columns_for_mode(mode)
     C = cfg["columns"]
 
-    # Ensure needed columns exist
-    required = [C["bol"], C["tracked"], C["p_name"], C["p_city_state"], C["p_country"],
-                C["d_name"], C["d_city_state"], C["d_country"], C["start_ts"], C["end_ts"]]
-    for col in required:
+    # Ensure needed columns exist (create blanks if missing)
+    base_needed = [C.get("bol"), C.get("p_name"), C.get("p_country"),
+                   C.get("d_name"), C.get("d_country"), C.get("start_ts"), C.get("end_ts")]
+    for col in [x for x in base_needed if x]:
         if col not in df.columns:
             df[col] = np.nan
+    # Ocean miss flags (if applicable)
+    if cfg["classification"] == "ocean_rules":
+        for mcol in C.get("miss_flags", []):
+            if mcol not in df.columns:
+                df[mcol] = np.nan
 
-    # Convenience Series
-    trk   = df[C["tracked"]]
-    dep   = df[C["start_ts"]]
-    arr   = df[C["end_ts"]]
-
-    # Parse timestamps
+    # Timestamps
+    dep = df[C["start_ts"]] if C.get("start_ts") in df.columns else pd.Series([np.nan] * len(df))
+    arr = df[C["end_ts"]]   if C.get("end_ts")   in df.columns else pd.Series([np.nan] * len(df))
     dep_ts = dep.apply(parse_timestamp_utc)
     arr_ts = arr.apply(parse_timestamp_utc)
 
-    # Compute transit days (raw float) & rounded days
+    # Raw delta and rounded days
     delta_days = (arr_ts - dep_ts).dt.total_seconds() / (24 * 3600)
     valid_transit = delta_days > 0
     in_transit_days = delta_days.apply(lambda x: int(round_half_up_days(x)) if pd.notna(x) else np.nan)
 
-    # Categories (mutually exclusive)
-    is_untracked     = trk.apply(is_false_like)
-    is_tracked_true  = trk.apply(is_true_like)
-    is_missing       = (~is_untracked) & is_tracked_true & (~valid_transit.fillna(False))
-    is_tracked_good  = (~is_untracked) & is_tracked_true & valid_transit.fillna(False)
+    # -------- Classification by mode --------
+    if cfg["classification"] == "ocean_rules":
+        miss_cols = C.get("miss_flags", [])
+        miss_df = df[miss_cols].apply(pd.to_numeric, errors="coerce") if miss_cols else pd.DataFrame(index=df.index)
+        all_missed = miss_df.apply(lambda r: np.all(r == 1), axis=1) if not miss_df.empty else pd.Series(False, index=df.index)
 
-    # Small summary counts & average (Tracked group only)
+        # Missing: start or end blank, or non-positive duration
+        missing = (~all_missed) & (dep_ts.isna() | arr_ts.isna() | ~valid_transit.fillna(False))
+        tracked_good = ~(all_missed | missing)
+
+        is_untracked = all_missed
+        is_missing   = missing
+        is_tracked_good = tracked_good
+
+    else:
+        # Tracked boolean logic (FTL/LTL/Parcel)
+        tracked_series = df[C.get("tracked")] if C.get("tracked") in df.columns else pd.Series([np.nan]*len(df))
+        is_untracked     = tracked_series.apply(is_false_like)
+        is_tracked_true  = tracked_series.apply(is_true_like)
+        is_missing       = (~is_untracked) & is_tracked_true & (~valid_transit.fillna(False))
+        is_tracked_good  = (~is_untracked) & is_tracked_true & valid_transit.fillna(False)
+
+    # Small summary counts & average over tracked group
     cnt_untracked = int(is_untracked.sum())
     cnt_missing   = int(is_missing.sum())
     cnt_tracked   = int(is_tracked_good.sum())
@@ -235,35 +280,57 @@ def build_summary_tables(df_raw: pd.DataFrame, mode: str):
     tracked_days = in_transit_days.where(is_tracked_good)
     avg_tracked = float(pd.to_numeric(tracked_days, errors="coerce").dropna().mean()) if cnt_tracked > 0 else ""
 
-    # Small table (rows 1–5)
+    # Build small table (rows 1–5)
     small = pd.DataFrame({
         "Label": ["Tracked", "Missed Milestone", "Untracked", "Grand Total"],
         "Shipment Count": [cnt_tracked, cnt_missing, cnt_untracked, grand_total],
-        "": ["", "", "", ""],  # blank col (row 1 col C)
+        "": ["", "", "", ""],  # blank col C
         "Average of In-Transit Time": ["", "", "", avg_tracked],
-        cfg["e1_text"]: ["", "", "", ""],  # customized E1 header
+        cfg["e1_text"]: ["", "", "", ""],  # dynamic E1 header text
     })
 
-    # Main table (only rows with numeric in-transit days = tracked_good)
+    # Main table: only tracked_good rows with numeric in-transit days
     rows = df[is_tracked_good].copy()
 
-    def as_str(s): return rows[s].astype(str) if s in rows.columns else pd.Series([""] * len(rows))
-    p_city, p_state = [], []
-    d_city, d_state = [], []
-    if len(rows):
-        p_city, p_state = zip(*as_str(C["p_city_state"]).map(split_city_state)) if C["p_city_state"] in rows.columns else ([], [])
-        d_city, d_state = zip(*as_str(C["d_city_state"]).map(split_city_state)) if C["d_city_state"] in rows.columns else ([], [])
+    def as_str(col_name):
+        if not col_name or col_name not in rows.columns:
+            return pd.Series([""] * len(rows))
+        return rows[col_name].astype(str)
+
+    # City/state split (if sources exist)
+    def split_series(col_name):
+        if col_name and col_name in rows.columns:
+            s = rows[col_name].astype(str)
+            if len(s):
+                a, b = zip(*s.map(split_city_state))
+                return list(a), list(b)
+        return [""] * len(rows), [""] * len(rows)
+
+    # Prepare columns by mode
+    p_city, p_state = split_series(C.get("p_city_state"))
+    d_city, d_state = split_series(C.get("d_city_state"))
+
+    # First column header and values differ for Ocean
+    first_col_header = cfg.get("main_first_col_header", "Bill of Lading")
+    if cfg["classification"] == "ocean_rules":
+        first_values = as_str(C.get("bol")).str.strip()
+        if (first_values == "").all():
+            alt = C.get("fallback_bol")
+            if alt and alt in rows.columns:
+                first_values = rows[alt].astype(str).str.strip()
+    else:
+        first_values = as_str(C.get("bol")).str.strip()
 
     main = pd.DataFrame({
-        "Bill of Lading": as_str(C["bol"]).str.strip(),
-        "Pickup Name": as_str(C["p_name"]).str.strip(),
-        "Pickup City": list(p_city) if p_city else [""] * len(rows),
-        "Pickup State": list(p_state) if p_state else [""] * len(rows),
-        "Pickup Country": as_str(C["p_country"]).str.strip(),
-        "Dropoff Name": as_str(C["d_name"]).str.strip(),
-        "Dropoff City": list(d_city) if d_city else [""] * len(rows),
-        "Dropoff State": list(d_state) if d_state else [""] * len(rows),
-        "Dropoff Country": as_str(C["d_country"]).str.strip(),
+        first_col_header: first_values,
+        "Pickup Name": as_str(C.get("p_name")).str.strip(),
+        "Pickup City": p_city,
+        "Pickup State": p_state,
+        "Pickup Country": as_str(C.get("p_country")).str.strip(),
+        "Dropoff Name": as_str(C.get("d_name")).str.strip(),
+        "Dropoff City": d_city,
+        "Dropoff State": d_state,
+        "Dropoff Country": as_str(C.get("d_country")).str.strip(),
         "Average of In-Transit Time": tracked_days[is_tracked_good].astype("Int64"),
     })
 
@@ -273,15 +340,15 @@ def build_summary_tables(df_raw: pd.DataFrame, mode: str):
     else:
         javg = ""
     total_row = {col: "" for col in main.columns}
-    total_row["Bill of Lading"] = "Grand Total"
+    total_row[first_col_header] = "Grand Total"
     total_row["Average of In-Transit Time"] = javg
     main = pd.concat([main, pd.DataFrame([total_row])], ignore_index=True)
 
     return small, main
 
-# -----------------------------
+# -----------------------------------
 # Excel writer (single sheet, no styling)
-# -----------------------------
+# -----------------------------------
 def build_summary_excel(small_df: pd.DataFrame, main_df: pd.DataFrame, mode_name: str) -> bytes | None:
     engine = pick_xlsx_engine()
     if not engine:
@@ -294,9 +361,9 @@ def build_summary_excel(small_df: pd.DataFrame, main_df: pd.DataFrame, mode_name
     out.seek(0)
     return out.getvalue()
 
-# -----------------------------
+# -----------------------------------
 # Single CSV builder (both tables in one file)
-# -----------------------------
+# -----------------------------------
 def build_summary_single_csv(small_df: pd.DataFrame, main_df: pd.DataFrame) -> bytes:
     buf = io.StringIO()
     small_df.to_csv(buf, index=False)
@@ -304,14 +371,14 @@ def build_summary_single_csv(small_df: pd.DataFrame, main_df: pd.DataFrame) -> b
     main_df.to_csv(buf, index=False)
     return buf.getvalue().encode("utf-8")
 
-# -----------------------------
+# -----------------------------------
 # UI
-# -----------------------------
+# -----------------------------------
 mode = st.selectbox(
     "Mode",
-    options=list(MODE_CONFIG.keys()),
+    options=["FTL", "LTL", "Parcel", "Ocean"],
     index=0,
-    help="FTL, LTL, and Parcel have exact mappings. Ocean/Air reuse FTL until you provide their columns."
+    help="All four modes wired per your rules."
 )
 uploaded = st.file_uploader("Upload RAW file (CSV or Excel)", type=["csv", "xlsx", "xls"], accept_multiple_files=False)
 st.caption(f"Selected mode: **{mode}**")
