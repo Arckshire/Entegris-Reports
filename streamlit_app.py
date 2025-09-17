@@ -61,11 +61,9 @@ def find_col(df: pd.DataFrame, targets: list[str]) -> str | None:
     if not len(df.columns): return None
     cmap = {c: canon(c) for c in df.columns}
     tcanon = [canon(t) for t in targets]
-    # exact canonical
-    for c, cc in cmap.items():
+    for c, cc in cmap.items():          # exact canonical
         if cc in tcanon: return c
-    # regex
-    for pat in targets:
+    for pat in targets:                 # regex on canonical
         cp = canon(pat)
         try:
             rx = re.compile(cp)
@@ -78,10 +76,7 @@ def find_col(df: pd.DataFrame, targets: list[str]) -> str | None:
 
 def find_cols_by_regex(df: pd.DataFrame, pattern: str) -> list[str]:
     rx = re.compile(pattern)
-    out = []
-    for c in df.columns:
-        if rx.search(canon(c)): out.append(c)
-    return out
+    return [c for c in df.columns if rx.search(canon(c))]
 
 # -----------------------------------
 # Value & parse helpers
@@ -106,6 +101,7 @@ def is_false_like(v):
     return False
 
 def parse_timestamp_utc(s):
+    # Works for strings, pandas Timestamps, datetimes, Excel datetimes read as datetime64
     if pd.isna(s): return pd.NaT
     return pd.to_datetime(s, utc=True, errors="coerce")
 
@@ -217,15 +213,15 @@ def load_table(uploaded_file) -> pd.DataFrame:
     raw_bytes = uploaded_file.read()
     name = (uploaded_file.name or "").lower()
 
-    # Excel by extension/signature
+    # IMPORTANT: Excel -> do NOT force dtype=str (we need real datetime types)
     if name.endswith((".xlsx", ".xls")) or raw_bytes[:2] == b"PK":
         try:
             _ensure_pkg("openpyxl", "openpyxl>=3.1.5")
-            return pd.read_excel(io.BytesIO(raw_bytes), dtype=str)
+            return pd.read_excel(io.BytesIO(raw_bytes))  # keep native dtypes
         except Exception:
             pass
 
-    # CSV as text (dtype=str to avoid date auto-coerce issues)
+    # CSV: read as text so weird formats don't crash; we parse later
     for enc in ["utf-8", "utf-8-sig", "cp1252", "latin-1", "utf-16", "utf-16-le", "utf-16-be"]:
         try:
             return pd.read_csv(
@@ -242,7 +238,7 @@ def load_table(uploaded_file) -> pd.DataFrame:
 
     # Last resort: try Excel again
     _ensure_pkg("openpyxl", "openpyxl>=3.1.5")
-    return pd.read_excel(io.BytesIO(raw_bytes), dtype=str)
+    return pd.read_excel(io.BytesIO(raw_bytes))
 
 # -----------------------------------
 # Core builder: Summary only
@@ -298,6 +294,7 @@ def build_summary_tables(df_raw: pd.DataFrame, mode: str):
     delta_sec = (arr_ts - dep_ts).dt.total_seconds()
     delta_days = (delta_sec / (24*3600)).astype("float64")  # float NaN where missing
     valid_transit = delta_days > 0
+    in_transit_days_full = delta_days.apply(lambda x: round_half_up_days_scalar(x) if not np.isnan(x) else np.nan)
 
     # ---------- classification (full df) ----------
     if cfg["classification"] == "ocean_rules":
@@ -307,7 +304,7 @@ def build_summary_tables(df_raw: pd.DataFrame, mode: str):
         else:
             all_missed = pd.Series(False, index=df.index)
 
-        # Missing if either ts blank or duration <= 0 (keeps consistency with other modes)
+        # Missing if either ts blank or duration <= 0
         missing = (~all_missed) & (dep_ts.isna() | arr_ts.isna() | ~valid_transit.fillna(False))
         is_untracked    = all_missed
         is_missing      = missing
@@ -325,7 +322,6 @@ def build_summary_tables(df_raw: pd.DataFrame, mode: str):
     cnt_tracked   = int(is_tracked_good.sum())
     grand_total   = cnt_untracked + cnt_missing + cnt_tracked
 
-    in_transit_days_full = delta_days.apply(lambda x: round_half_up_days_scalar(x) if not np.isnan(x) else np.nan)
     tracked_days_full = pd.Series(in_transit_days_full).where(is_tracked_good)
     avg_tracked = safe_mean(tracked_days_full)
 
@@ -337,7 +333,7 @@ def build_summary_tables(df_raw: pd.DataFrame, mode: str):
         MODE_CONFIG[mode]["e1_text"]: ["", "", "", ""],
     })
 
-    # ---------- MAIN TABLE (build from filtered rows; align lengths) ----------
+    # ---------- MAIN TABLE (filtered rows; all columns aligned) ----------
     rows_mask = is_tracked_good.fillna(False)
     rows = df[rows_mask].reset_index(drop=True)
     n = len(rows)
@@ -461,6 +457,7 @@ st.caption(f"Selected mode: **{mode}**")
 if uploaded:
     try:
         df_raw = load_table(uploaded)
+        st.write(f"**Rows loaded:** {len(df_raw):,} | **Columns:** {len(df_raw.columns)}")
         small_df, main_df, diag = build_summary_tables(df_raw, mode)
 
         st.success("Summary built successfully.")
