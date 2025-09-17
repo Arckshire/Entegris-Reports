@@ -52,18 +52,38 @@ def normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
 def canon(s: str) -> str:
     """Canonicalize a header: lowercase, collapse spaces, normalize dashes."""
     if s is None: return ""
-    s2 = str(s).replace("–","-").replace("—","-")
+    s2 = str(s).replace("–","-").replace("—","-").replace("\u00A0", " ")  # nbsp
     s2 = re.sub(r"\s+", " ", s2.strip())
     return s2.lower()
 
+def slug(s: str) -> str:
+    """Ultra-forgiving signature: remove all non-alphanumeric."""
+    return re.sub(r"[^a-z0-9]+", "", canon(s))
+
 def find_col(df: pd.DataFrame, targets: list[str]) -> str | None:
-    """Flexible finder: exact canonical match first, then regex search on canonical names."""
+    """
+    Robust finder:
+      1) exact canonical match
+      2) exact slug match (remove punctuation/spaces)
+      3) regex search on canonical
+      4) contains search on canonical
+    Returns actual df column or None.
+    """
     if not len(df.columns): return None
     cmap = {c: canon(c) for c in df.columns}
+    smap = {c: slug(c)  for c in df.columns}
+
     tcanon = [canon(t) for t in targets]
-    for c, cc in cmap.items():          # exact canonical
+    tslug  = [slug(t)  for t in targets]
+
+    # 1) exact canonical
+    for c, cc in cmap.items():
         if cc in tcanon: return c
-    for pat in targets:                 # regex on canonical
+    # 2) exact slug
+    for c, sc in smap.items():
+        if sc in tslug: return c
+    # 3) regex on canonical
+    for pat in targets:
         cp = canon(pat)
         try:
             rx = re.compile(cp)
@@ -71,6 +91,12 @@ def find_col(df: pd.DataFrame, targets: list[str]) -> str | None:
             rx = re.compile(re.escape(cp))
         for c, cc in cmap.items():
             if rx.fullmatch(cc) or rx.search(cc):
+                return c
+    # 4) contains on canonical
+    for pat in targets:
+        cp = canon(pat)
+        for c, cc in cmap.items():
+            if cp and cp in cc:
                 return c
     return None
 
@@ -101,7 +127,7 @@ def is_false_like(v):
     return False
 
 def parse_timestamp_utc(s):
-    # Works for strings, pandas Timestamps, datetimes, Excel datetimes read as datetime64
+    # Works for strings, pandas Timestamps, datetimes, Excel datetime64, serial-like strings after pd.to_datetime
     if pd.isna(s): return pd.NaT
     return pd.to_datetime(s, utc=True, errors="coerce")
 
@@ -131,15 +157,24 @@ MODE_CONFIG = {
     "FTL": {
         "columns": {
             "bol": ["Bill of Lading"],
-            "tracked": ["Tracked"],
+            "tracked": ["Tracked", r"^track(ed)?$"],
             "p_name": ["Pickup Name"],
             "p_city_state": ["Pickup City State"],
             "p_country": ["Pickup Country"],
-            "d_name": ["Final Destination Name"],
-            "d_city_state": ["Final Destination City State"],
-            "d_country": ["Final Destination Country"],
-            "start_ts": ["Pickup Departure Milestone (UTC)"],
-            "end_ts":   ["Final Destination Arrival Milestone (UTC)"],
+            "d_name": ["Final Destination Name", "Destination Name"],
+            "d_city_state": ["Final Destination City State", "Dropoff City State"],
+            "d_country": ["Final Destination Country", "Dropoff Country"],
+            # Be forgiving on milestone/timestamp wording
+            "start_ts": [
+                "Pickup Departure Milestone (UTC)",
+                r"pickup.*departure.*(milestone|timestamp).*utc",
+                r"pickup.*depart.*utc"
+            ],
+            "end_ts": [
+                "Final Destination Arrival Milestone (UTC)",
+                r"(final destination|destination|dropoff).*arrival.*(milestone|timestamp).*utc",
+                r"(final destination|destination|dropoff).*arriv.*utc"
+            ],
         },
         "e1_text": "Time taken from Departure to Arrival",
         "classification": "tracked_boolean",
@@ -148,15 +183,21 @@ MODE_CONFIG = {
     "LTL": {
         "columns": {
             "bol": ["Bill of Lading"],
-            "tracked": ["Tracked"],
+            "tracked": ["Tracked", r"^track(ed)?$"],
             "p_name": ["Pickup Name"],
             "p_city_state": ["Pickup City State"],
             "p_country": ["Pickup Country"],
             "d_name": ["Destination Name"],
             "d_city_state": ["Dropoff City State"],
             "d_country": ["Dropoff Country"],
-            "start_ts": ["Pickup Utc Timestamp Time"],
-            "end_ts":   ["Delivered Utc Timestamp Time"],
+            "start_ts": [
+                "Pickup Utc Timestamp Time",
+                r"pickup.*(utc)?.*timestamp",
+            ],
+            "end_ts": [
+                "Delivered Utc Timestamp Time",
+                r"deliver.*(utc)?.*timestamp",
+            ],
         },
         "e1_text": "Time taken from Pickup to Delivered",
         "classification": "tracked_boolean",
@@ -165,15 +206,21 @@ MODE_CONFIG = {
     "Parcel": {
         "columns": {
             "bol": ["Bill of Lading"],
-            "tracked": ["Tracked"],
+            "tracked": ["Tracked", r"^track(ed)?$"],
             "p_name": ["Pickup Name"],
-            "p_city_state": ["Pickup City State"],  # may not exist; handled
+            "p_city_state": ["Pickup City State"],
             "p_country": ["Pickup Country"],
             "d_name": ["Destination Name"],
-            "d_city_state": ["Dropoff City State"], # may not exist; handled
+            "d_city_state": ["Dropoff City State"],
             "d_country": ["Dropoff Country"],
-            "start_ts": ["Departed Utc Timestamp Time"],
-            "end_ts":   ["Delivered Utc Timestamp Time"],
+            "start_ts": [
+                "Departed Utc Timestamp Time",
+                r"depart(ed)?.*(utc)?.*timestamp",
+            ],
+            "end_ts": [
+                "Delivered Utc Timestamp Time",
+                r"deliver.*(utc)?.*timestamp",
+            ],
         },
         "e1_text": "Time taken from Departed to Delivered",
         "classification": "tracked_boolean",
@@ -184,14 +231,20 @@ MODE_CONFIG = {
             "bol": ["Container Number"],
             "fallback_bol": ["Shipment ID"],
             "tracked": None,  # not used
-            "p_name": ["Pol"],
+            "p_name": ["Pol", r"^pol$"],
             "p_city_state": None,
             "p_country": None,
-            "d_name": ["Pod"],
+            "d_name": ["Pod", r"^pod$"],
             "d_city_state": None,
             "d_country": None,
-            "start_ts": [r"^\s*2\s*-\s*gate in timestamp\s*$", "2-Gate In Timestamp", "Gate In Timestamp"],
-            "end_ts":   [r"^\s*7\s*-\s*gate out timestamp\s*$", "7-Gate Out Timestamp", "Gate Out Timestamp"],
+            "start_ts": [
+                r"^\s*2\s*-\s*gate in timestamp\s*$",
+                "2-Gate In Timestamp", "Gate In Timestamp", r"gate.*in.*timestamp"
+            ],
+            "end_ts": [
+                r"^\s*7\s*-\s*gate out timestamp\s*$",
+                "7-Gate Out Timestamp", "Gate Out Timestamp", r"gate.*out.*timestamp"
+            ],
             "miss_flags_hint": [r"\bmissed\b"],  # auto-detect columns containing 'Missed'
         },
         "e1_text": "Time taken from Gate In to Gate Out",
@@ -213,15 +266,15 @@ def load_table(uploaded_file) -> pd.DataFrame:
     raw_bytes = uploaded_file.read()
     name = (uploaded_file.name or "").lower()
 
-    # IMPORTANT: Excel -> do NOT force dtype=str (we need real datetime types)
+    # Excel with native dtypes (so timestamps remain datetimes)
     if name.endswith((".xlsx", ".xls")) or raw_bytes[:2] == b"PK":
         try:
             _ensure_pkg("openpyxl", "openpyxl>=3.1.5")
-            return pd.read_excel(io.BytesIO(raw_bytes))  # keep native dtypes
+            return pd.read_excel(io.BytesIO(raw_bytes))
         except Exception:
             pass
 
-    # CSV: read as text so weird formats don't crash; we parse later
+    # CSV: robust text load; we'll parse timestamps later
     for enc in ["utf-8", "utf-8-sig", "cp1252", "latin-1", "utf-16", "utf-16-le", "utf-16-be"]:
         try:
             return pd.read_csv(
@@ -236,7 +289,6 @@ def load_table(uploaded_file) -> pd.DataFrame:
         except Exception:
             continue
 
-    # Last resort: try Excel again
     _ensure_pkg("openpyxl", "openpyxl>=3.1.5")
     return pd.read_excel(io.BytesIO(raw_bytes))
 
@@ -284,7 +336,7 @@ def build_summary_tables(df_raw: pd.DataFrame, mode: str):
                 m = re.match(r"^\s*(\d+)", canon(c))
                 return int(m.group(1)) if m else 999
             miss_candidates = sorted(miss_candidates, key=miss_key)
-            miss_cols = miss_candidates[:8]  # prefer first 8 by numeric prefix
+            miss_cols = miss_candidates[:8]  # prefer first 8
         else:
             miss_cols = []
 
@@ -304,7 +356,6 @@ def build_summary_tables(df_raw: pd.DataFrame, mode: str):
         else:
             all_missed = pd.Series(False, index=df.index)
 
-        # Missing if either ts blank or duration <= 0
         missing = (~all_missed) & (dep_ts.isna() | arr_ts.isna() | ~valid_transit.fillna(False))
         is_untracked    = all_missed
         is_missing      = missing
@@ -398,8 +449,8 @@ def build_summary_tables(df_raw: pd.DataFrame, mode: str):
     total_row["Average of In-Transit Time"] = javg
     main = pd.concat([main, pd.DataFrame([total_row])], ignore_index=True)
 
-    # Diagnostics (to help if vendor tweaks headers)
-    if mode == "Ocean":
+    # Diagnostics (which columns were detected)
+    if cfg["classification"] == "ocean_rules":
         diag = {
             "Detected start_ts": start_colname or "(not found)",
             "Detected end_ts": end_colname or "(not found)",
