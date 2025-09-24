@@ -149,8 +149,9 @@ FTL_RAW_MAP = {
 }
 
 def build_ftl_tables(df_raw: pd.DataFrame):
-    """This is your working FTL logic from the older script, with one important fix:
-    ensure the 'Average of In-Transit Time' column aligns to the filtered rows index.
+    """Working FTL logic with robust index handling to avoid length mismatches.
+    Root cause previously: mixing Series that kept original indices with list/array
+    columns based on a filtered DataFrame. We now reset indices consistently.
     """
     df = normalize_headers(df_raw).copy()
 
@@ -194,24 +195,29 @@ def build_ftl_tables(df_raw: pd.DataFrame):
     small = pd.DataFrame({
         "Label": ["Tracked", "Missed Milestone", "Untracked", "Grand Total"],
         "Shipment Count": [cnt_tracked, cnt_missing, cnt_untracked, grand_total],
-        "": ["", "", "", ""],  # blank col
+        "": ["", "", "", ""],
         "Average of In-Transit Time": ["", "", "", avg_tracked],
         "Time taken from Departure to Arrival": ["", "", "", ""],
     })
 
-    # Main table (only rows with numeric in-transit days = tracked_good)
-    rows = df[is_tracked_good].copy()
+    # === Main table (tracked only) with SAFE index workflow ===
+    rows = df[is_tracked_good].copy().reset_index(drop=True)
 
-    # City/state split
-    p_city, p_state = ([], [])
-    d_city, d_state = ([], [])
+    # City/state split (based on rows)
     if len(rows):
         p_city, p_state = zip(*rows[FTL_RAW_MAP["p_city_state"]].astype(str).map(split_city_state))
         d_city, d_state = zip(*rows[FTL_RAW_MAP["d_city_state"]].astype(str).map(split_city_state))
+    else:
+        p_city, p_state, d_city, d_state = ([], [], [], [])
 
-    # IMPORTANT FIX: align tracked_days to rows index to avoid misalignment in the DataFrame constructor
-    avg_days_col = pd.to_numeric(tracked_days.loc[rows.index], errors="coerce").astype("Int64") if len(rows) else pd.Series(dtype="Int64")
+    # Align transit days using the same boolean mask order, then reset index
+    avg_days_col = (
+        pd.to_numeric(in_transit_days[is_tracked_good], errors="coerce")
+          .astype("Int64")
+          .reset_index(drop=True)
+    ) if cnt_tracked > 0 else pd.Series([], dtype="Int64")
 
+    # Build main with everything length-aligned
     main = pd.DataFrame({
         "Bill of Lading": rows[FTL_RAW_MAP["bol"]].astype(str).str.strip(),
         "Pickup Name": rows[FTL_RAW_MAP["p_name"]].astype(str).str.strip(),
@@ -222,7 +228,7 @@ def build_ftl_tables(df_raw: pd.DataFrame):
         "Dropoff City": list(d_city),
         "Dropoff State": list(d_state),
         "Dropoff Country": rows[FTL_RAW_MAP["d_country"]].astype(str).str.strip(),
-        "Average of In-Transit Time": avg_days_col.reset_index(drop=True),
+        "Average of In-Transit Time": avg_days_col,
     })
 
     # Append Grand Total average row
@@ -302,17 +308,20 @@ def build_ltl_tables(df_raw: pd.DataFrame):
         LTL_MAP["def_col_e"]: ["", "", "", ""],
     })
 
-    # Main table (tracked only)
-    rows = df[is_tracked_good].copy()
+    # Main table (tracked only) — SAFE index workflow
+    rows = df[is_tracked_good].copy().reset_index(drop=True)
 
-    p_city, p_state = ([], [])
-    d_city, d_state = ([], [])
     if len(rows):
         p_city, p_state = zip(*rows[LTL_MAP["p_city_state"]].astype(str).map(split_city_state))
         d_city, d_state = zip(*rows[LTL_MAP["d_city_state"]].astype(str).map(split_city_state))
+    else:
+        p_city, p_state, d_city, d_state = ([], [], [], [])
 
-    # Align to rows index as well (parity with FTL fix)
-    avg_days_col = pd.to_numeric(in_transit_days.where(is_tracked_good).loc[rows.index], errors="coerce").astype("Int64") if len(rows) else pd.Series(dtype="Int64")
+    avg_days_col = (
+        pd.to_numeric(in_transit_days[is_tracked_good], errors="coerce")
+          .astype("Int64")
+          .reset_index(drop=True)
+    ) if cnt_tracked > 0 else pd.Series([], dtype="Int64")
 
     main = pd.DataFrame({
         "Pro Number": rows[LTL_MAP["pro"]].astype(str).str.strip(),
@@ -324,7 +333,7 @@ def build_ltl_tables(df_raw: pd.DataFrame):
         "Dropoff City": list(d_city),
         "Dropoff State": list(d_state),
         "Dropoff Region": rows[LTL_MAP["d_region"]].astype(str).str.strip(),
-        "Average of In-Transit Time": avg_days_col.reset_index(drop=True),
+        "Average of In-Transit Time": avg_days_col,
     })
 
     # Grand Total avg row
