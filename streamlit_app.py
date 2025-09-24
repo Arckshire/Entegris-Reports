@@ -35,7 +35,7 @@ def pick_xlsx_engine() -> str:
     return ""  # neither available
 
 # -----------------------------
-# Parsing helpers (unchanged)
+# Parsing helpers
 # -----------------------------
 def normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -99,7 +99,7 @@ def split_city_state(text: str):
     return s, ""
 
 # -----------------------------
-# Loader (CSV or Excel) — unchanged
+# Loader (CSV or Excel)
 # -----------------------------
 def load_table(uploaded_file) -> pd.DataFrame:
     raw_bytes = uploaded_file.read()
@@ -133,7 +133,7 @@ def load_table(uploaded_file) -> pd.DataFrame:
     return pd.read_excel(io.BytesIO(raw_bytes))
 
 # =============================
-# FTL (EXACTLY your working logic)
+# FTL (Original, corrected for alignment)
 # =============================
 FTL_RAW_MAP = {
     "bol": "Bill of Lading",
@@ -149,7 +149,9 @@ FTL_RAW_MAP = {
 }
 
 def build_ftl_tables(df_raw: pd.DataFrame):
-    # This function is the same logic as your working "build_summary_tables"
+    """This is your working FTL logic from the older script, with one important fix:
+    ensure the 'Average of In-Transit Time' column aligns to the filtered rows index.
+    """
     df = normalize_headers(df_raw).copy()
 
     # Ensure needed columns exist
@@ -169,6 +171,7 @@ def build_ftl_tables(df_raw: pd.DataFrame):
     # Compute transit days (raw float)
     delta_days = (arr_ts - dep_ts).dt.total_seconds() / (24 * 3600)
     valid_transit = delta_days > 0
+
     # Rounded days
     in_transit_days = delta_days.apply(lambda x: int(round_half_up_days(x)) if pd.notna(x) else np.nan)
 
@@ -176,7 +179,7 @@ def build_ftl_tables(df_raw: pd.DataFrame):
     is_untracked     = trk.apply(is_false_like)
     is_tracked_true  = trk.apply(is_true_like)
     is_missing       = (~is_untracked) & is_tracked_true & (~valid_transit.fillna(False))
-    is_tracked_good  = (~is_untracked) & is_tracked_true & valid_transit.fillna(False)
+    is_tracked_good  = (~is_untracked) & is_tracked_true &  valid_transit.fillna(False)
 
     # Small summary counts & average
     cnt_untracked = int(is_untracked.sum())
@@ -200,12 +203,14 @@ def build_ftl_tables(df_raw: pd.DataFrame):
     rows = df[is_tracked_good].copy()
 
     # City/state split
-    def cs(series): return series.astype(str)
     p_city, p_state = ([], [])
     d_city, d_state = ([], [])
     if len(rows):
-        p_city, p_state = zip(*cs(rows[FTL_RAW_MAP["p_city_state"]]).map(split_city_state))
-        d_city, d_state = zip(*cs(rows[FTL_RAW_MAP["d_city_state"]]).map(split_city_state))
+        p_city, p_state = zip(*rows[FTL_RAW_MAP["p_city_state"]].astype(str).map(split_city_state))
+        d_city, d_state = zip(*rows[FTL_RAW_MAP["d_city_state"]].astype(str).map(split_city_state))
+
+    # IMPORTANT FIX: align tracked_days to rows index to avoid misalignment in the DataFrame constructor
+    avg_days_col = pd.to_numeric(tracked_days.loc[rows.index], errors="coerce").astype("Int64") if len(rows) else pd.Series(dtype="Int64")
 
     main = pd.DataFrame({
         "Bill of Lading": rows[FTL_RAW_MAP["bol"]].astype(str).str.strip(),
@@ -217,7 +222,7 @@ def build_ftl_tables(df_raw: pd.DataFrame):
         "Dropoff City": list(d_city),
         "Dropoff State": list(d_state),
         "Dropoff Country": rows[FTL_RAW_MAP["d_country"]].astype(str).str.strip(),
-        "Average of In-Transit Time": tracked_days[is_tracked_good].astype("Int64"),
+        "Average of In-Transit Time": avg_days_col.reset_index(drop=True),
     })
 
     # Append Grand Total average row
@@ -233,7 +238,7 @@ def build_ftl_tables(df_raw: pd.DataFrame):
     return small, main
 
 # =============================
-# LTL (as per your detailed spec)
+# LTL (as per your detailed spec, unchanged)
 # =============================
 LTL_MAP = {
     "pro": "PRO number",
@@ -306,6 +311,9 @@ def build_ltl_tables(df_raw: pd.DataFrame):
         p_city, p_state = zip(*rows[LTL_MAP["p_city_state"]].astype(str).map(split_city_state))
         d_city, d_state = zip(*rows[LTL_MAP["d_city_state"]].astype(str).map(split_city_state))
 
+    # Align to rows index as well (parity with FTL fix)
+    avg_days_col = pd.to_numeric(in_transit_days.where(is_tracked_good).loc[rows.index], errors="coerce").astype("Int64") if len(rows) else pd.Series(dtype="Int64")
+
     main = pd.DataFrame({
         "Pro Number": rows[LTL_MAP["pro"]].astype(str).str.strip(),
         "Pickup Name": rows[LTL_MAP["p_name"]].astype(str).str.strip(),
@@ -316,7 +324,7 @@ def build_ltl_tables(df_raw: pd.DataFrame):
         "Dropoff City": list(d_city),
         "Dropoff State": list(d_state),
         "Dropoff Region": rows[LTL_MAP["d_region"]].astype(str).str.strip(),
-        "Average of In-Transit Time": tracked_days[is_tracked_good].astype("Int64"),
+        "Average of In-Transit Time": avg_days_col.reset_index(drop=True),
     })
 
     # Grand Total avg row
@@ -332,7 +340,7 @@ def build_ltl_tables(df_raw: pd.DataFrame):
     return small, main
 
 # -----------------------------
-# Excel / CSV exporters (unchanged)
+# Excel / CSV exporters
 # -----------------------------
 def build_summary_excel(small_df: pd.DataFrame, main_df: pd.DataFrame, mode_name: str) -> bytes | None:
     engine = pick_xlsx_engine()
@@ -366,7 +374,7 @@ mode = st.selectbox(
     "Choose Product",
     options=["FTL", "LTL"],
     index=0,
-    help="FTL is your original logic; LTL uses Pickup→Delivered timestamps and PRO/Region fields."
+    help="FTL uses your original working logic (fixed for index alignment). LTL uses Pickup→Delivered timestamps and PRO/Region fields."
 )
 
 uploaded = st.file_uploader("Upload RAW file (CSV or Excel)", type=["csv", "xlsx", "xls"], accept_multiple_files=False)
@@ -377,7 +385,7 @@ if uploaded:
         df_raw = load_table(uploaded)
         st.write(f"**Rows loaded:** {len(df_raw):,} | **Columns:** {len(df_raw.columns)}")
         if mode == "FTL":
-            small_df, main_df = build_ftl_tables(df_raw)  # EXACT original FTL behavior
+            small_df, main_df = build_ftl_tables(df_raw)
         else:
             small_df, main_df = build_ltl_tables(df_raw)
 
