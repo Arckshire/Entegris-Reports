@@ -10,8 +10,8 @@ import streamlit as st
 # -----------------------------
 # App meta
 # -----------------------------
-st.set_page_config(page_title="Entegris Reports — Summary Builder", page_icon="📦", layout="wide")
-st.title("Entegris Reports — Summary Builder (Tracked / Missed / Untracked)")
+st.set_page_config(page_title="In Transit Time Report Generator", page_icon="📦", layout="wide")
+st.title("In Transit Time Report Generator")")
 
 # -----------------------------
 # Dependency helper for Excel
@@ -274,11 +274,9 @@ def build_ltl_tables(df_raw: pd.DataFrame):
             df[col] = np.nan
 
     trk = df[LTL_MAP["tracked"]]
-    dep = df[LTL_MAP["start_ts"]]
-    arr = df[LTL_MAP["end_ts"]]
 
-    dep_ts = dep.apply(parse_timestamp_utc)
-    arr_ts = arr.apply(parse_timestamp_utc)
+    dep_ts = df[LTL_MAP["start_ts"]].apply(parse_timestamp_utc)
+    arr_ts = df[LTL_MAP["end_ts"]].apply(parse_timestamp_utc)
 
     # Delta and rounding
     delta_days = (arr_ts - dep_ts).dt.total_seconds() / (24 * 3600)
@@ -376,14 +374,140 @@ def build_summary_single_csv(small_df: pd.DataFrame, main_df: pd.DataFrame) -> b
     main_df.to_csv(buf, index=False)
     return buf.getvalue().encode("utf-8")
 
+# =============================
+# PARCEL (new product)
+# =============================
+PARCEL_MAP = {
+    "shipment_id": "Shipment ID",
+    "carrier_id": "Carrier ID",
+    "carrier_name": "Carrier Name",
+    "tenant_id": "Tenant ID",
+    "tenant_name": "Tenant Name",
+    "bol": "Bill of Lading",
+    "order_number": "Order Number",
+    "tracking_number": "Tracking Number",
+    "tracked": "Tracked",
+    "pickup_region": "Pickup Region",
+    "pickup_country": "Pickup Country",
+    "pickup_name": "Pickup Name",
+    "dropoff_region": "Dropoff Country Region",
+    "dropoff_country": "Dropoff Country",
+    "destination_name": "Destination Name",
+    "pickup_ts": "Pickup Utc Timestamp Time",
+    "pickup_ret_ts": "Pickup Utc Retrieval Timestamp Time",
+    "departed_ts": "Departed Utc Timestamp Time",
+    "departed_ret_ts": "Departed Utc Retrieval Timestamp Time",
+    "ofd_ts": "Out for Delivery Utc Timestamp Time",
+    "ofd_ret_ts": "Out for Delivery Utc Retrieval Timestamp Time",
+    "arrived_ts": "Arrived Utc Timestamp Time",
+    "arrived_ret_ts": "Arrived Utc Retrieval Timestamp Time",
+    "delivered_ts": "Delivered Utc Timestamp Time",
+    "delivered_ret_ts": "Delivered Utc Retrieval Timestamp Time",
+    "nb_expected": "Nb Milestones Expected",
+    "nb_received": "Nb Milestones Received",
+    "latency_updates_received": "Latency Updates Received",
+    "latency_updates_passed": "Latency Updates Passed",
+    "latency_in_hour": "Latency In Hour",
+    "final_status_reason": "Final Status Reason",
+}
+
+# treat '0' or 0 as missing (specific to Parcel timestamps)
+def _parse_ts_zero_ok(x):
+    if pd.isna(x):
+        return pd.NaT
+    if (isinstance(x, str) and x.strip() == "0"):
+        return pd.NaT
+    if isinstance(x, (int, float)) and float(x) == 0.0:
+        return pd.NaT
+    return pd.to_datetime(x, utc=True, errors="coerce")
+
+
+def build_parcel_tables(df_raw: pd.DataFrame):
+    df = normalize_headers(df_raw).copy()
+
+    # ensure needed columns exist
+    for key, col in PARCEL_MAP.items():
+        if col not in df.columns:
+            df[col] = np.nan
+
+    trk = df[PARCEL_MAP["tracked"]]
+
+    dep_ts = df[PARCEL_MAP["departed_ts"]].apply(_parse_ts_zero_ok)
+    arr_ts = df[PARCEL_MAP["delivered_ts"]].apply(_parse_ts_zero_ok)
+
+    # compute delta
+    delta_days = (arr_ts - dep_ts).dt.total_seconds() / (24 * 3600)
+
+    # classification
+    is_untracked    = trk.apply(is_false_like)  # only explicit False counts as Untracked
+    is_tracked_true = trk.apply(is_true_like)
+
+    # missing if negative delta OR either ts missing
+    ts_missing = dep_ts.isna() | arr_ts.isna()
+    valid_transit = (delta_days > 0) & (~ts_missing)
+
+    is_missing = (~is_untracked) & is_tracked_true & (~valid_transit)
+    is_tracked_good = (~is_untracked) & is_tracked_true & valid_transit
+
+    # rounded days
+    in_transit_days = delta_days.apply(lambda x: int(round_half_up_days(x)) if pd.notna(x) else np.nan)
+
+    # counts & avg
+    cnt_untracked = int(is_untracked.sum())
+    cnt_missing   = int(is_missing.sum())
+    cnt_tracked   = int(is_tracked_good.sum())
+    grand_total   = cnt_untracked + cnt_missing + cnt_tracked
+
+    tracked_days = in_transit_days.where(is_tracked_good)
+    avg_tracked = float(pd.to_numeric(tracked_days, errors="coerce").dropna().mean()) if cnt_tracked > 0 else ""
+
+    # Small table
+    small = pd.DataFrame({
+        "Label": ["Tracked", "Untracked", "Missed Milestone", "Grand Total"],
+        "Shipment Count": [cnt_tracked, cnt_untracked, cnt_missing, grand_total],
+        "": ["", "", "", ""],
+        "Average of In-Transit Time": ["", "", "", avg_tracked],
+        "Time taken from Departure to Delivered": ["", "", "", ""],
+    })
+
+    # Main table for tracked shipments only
+    rows = df[is_tracked_good].copy().reset_index(drop=True)
+
+    avg_days_col = (
+        pd.to_numeric(in_transit_days[is_tracked_good], errors="coerce")
+          .astype("Int64")
+          .reset_index(drop=True)
+    ) if cnt_tracked > 0 else pd.Series([], dtype="Int64")
+
+    main = pd.DataFrame({
+        "Tracking Number": rows[PARCEL_MAP["tracking_number"]].astype(str).str.strip(),
+        "Pickup Region": rows[PARCEL_MAP["pickup_region"]].astype(str).str.strip(),
+        "Pickup Country": rows[PARCEL_MAP["pickup_country"]].astype(str).str.strip(),
+        "Dropoff Country Region": rows[PARCEL_MAP["dropoff_region"]].astype(str).str.strip(),
+        "Dropoff Country": rows[PARCEL_MAP["dropoff_country"]].astype(str).str.strip(),
+        "Average of In-Transit Time": avg_days_col,
+    })
+
+    # Append Grand Total avg row
+    if len(main) > 0:
+        javg = float(pd.to_numeric(main["Average of In-Transit Time"], errors="coerce").dropna().mean())
+    else:
+        javg = ""
+    total_row = {col: "" for col in main.columns}
+    total_row["Tracking Number"] = "Grand Total"
+    total_row["Average of In-Transit Time"] = javg
+    main = pd.concat([main, pd.DataFrame([total_row])], ignore_index=True)
+
+    return small, main
+
 # -----------------------------
 # UI
 # -----------------------------
 mode = st.selectbox(
     "Choose Product",
-    options=["FTL", "LTL"],
+    options=["FTL", "LTL", "Parcel"],
     index=0,
-    help="FTL uses your original working logic (fixed for index alignment). LTL uses Pickup→Delivered timestamps and PRO/Region fields."
+    help="FTL uses original working logic; LTL uses Pickup→Delivered timestamps and PRO/Region fields; Parcel uses Departed→Delivered (0 treated as missing)."
 )
 
 uploaded = st.file_uploader("Upload RAW file (CSV or Excel)", type=["csv", "xlsx", "xls"], accept_multiple_files=False)
@@ -395,8 +519,10 @@ if uploaded:
         st.write(f"**Rows loaded:** {len(df_raw):,} | **Columns:** {len(df_raw.columns)}")
         if mode == "FTL":
             small_df, main_df = build_ftl_tables(df_raw)
-        else:
+        elif mode == "LTL":
             small_df, main_df = build_ltl_tables(df_raw)
+        else:
+            small_df, main_df = build_parcel_tables(df_raw)
 
         st.success("Summary built successfully.")
 
@@ -430,8 +556,8 @@ if uploaded:
 
         st.caption(
             f"Counts — Tracked: {int(small_df.loc[0, 'Shipment Count'])}, "
-            f"Missed: {int(small_df.loc[1, 'Shipment Count'])}, "
-            f"Untracked: {int(small_df.loc[2, 'Shipment Count'])}, "
+            f"Untracked: {int(small_df.loc[1, 'Shipment Count']) if 'Untracked' in list(small_df['Label']) else int(small_df.loc[2, 'Shipment Count'])}, "
+            f"Missed: {int(small_df.loc[2, 'Shipment Count']) if 'Missed Milestone' in list(small_df['Label']) else int(small_df.loc[1, 'Shipment Count'])}, "
             f"Total: {int(small_df.loc[3, 'Shipment Count'])}"
         )
 
