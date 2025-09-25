@@ -491,6 +491,7 @@ def build_ocean_tables(df_raw: pd.DataFrame):
     gate_in_ts  = df[OCEAN_MAP["gate_in"]].apply(_parse_ts_zero_ok)
     gate_out_ts = df[OCEAN_MAP["gate_out"]].apply(_parse_ts_zero_ok)
 
+    # Untracked: all milestones empty/0
     all_empty_mask = pd.Series(True, index=df.index)
     for col in OCEAN_TS_ALL_FOR_UNTRACKED:
         col_ts = df[col].apply(_parse_ts_zero_ok)
@@ -507,6 +508,7 @@ def build_ocean_tables(df_raw: pd.DataFrame):
     gate_out_present  = ~gate_out_ts.isna()
     gate_out_missing  = gate_out_ts.isna()
 
+    # Any intermediate present?
     any_intermediate_present = pd.Series(False, index=df.index)
     for col in INTERMEDIATE_TS_FOR_INTRANSIT:
         any_intermediate_present |= ~df[col].apply(_parse_ts_zero_ok).isna()
@@ -517,7 +519,7 @@ def build_ocean_tables(df_raw: pd.DataFrame):
     # 2) Tracked (positive delta)
     is_tracked_good = delta_pos & (~is_untracked)
 
-    # 3) In-Transit:
+    # 3) In-Transit cases
     both_missing = gate_in_missing & gate_out_missing
     lifecycle_active = lifecycle_status.eq("active")
     intransit_case_d1 = both_missing & any_intermediate_present & lifecycle_active
@@ -525,7 +527,7 @@ def build_ocean_tables(df_raw: pd.DataFrame):
     intransit_case_d3 = gate_in_present & gate_out_missing & (~any_intermediate_present) & lifecycle_active
     is_in_transit = (intransit_case_d1 | intransit_case_d2 | intransit_case_d3) & (~is_untracked) & (~is_tracked_good)
 
-    # 4) Missing:
+    # 4) Missing milestone
     missing_case_b  = delta_neg
     missing_case_c  = gate_out_present & gate_in_missing
     missing_case_d1 = both_missing & any_intermediate_present & (~lifecycle_active)
@@ -533,17 +535,21 @@ def build_ocean_tables(df_raw: pd.DataFrame):
     is_missing = (missing_case_b | missing_case_c | missing_case_d1 | missing_case_d2)
     is_missing = is_missing & (~is_untracked) & (~is_tracked_good) & (~is_in_transit)
 
+    # Rounded days for tracked rows
     in_transit_days = delta_days.apply(lambda x: int(round_half_up_days(x)) if pd.notna(x) else np.nan)
 
+    # Counts
     cnt_untracked   = int(is_untracked.sum())
     cnt_in_transit  = int(is_in_transit.sum())
     cnt_missing     = int(is_missing.sum())
     cnt_tracked     = int(is_tracked_good.sum())
     grand_total     = cnt_untracked + cnt_in_transit + cnt_missing + cnt_tracked
 
+    # Average for tracked
     tracked_days = in_transit_days.where(is_tracked_good)
     avg_tracked = float(pd.to_numeric(tracked_days, errors="coerce").dropna().mean()) if cnt_tracked > 0 else ""
 
+    # Small table
     small = pd.DataFrame({
         "Label": [
             "Tracked",
@@ -564,6 +570,7 @@ def build_ocean_tables(df_raw: pd.DataFrame):
         "Time taken from Gate In to Gate Out": ["", "", "", "", ""],
     })
 
+    # Tracked rows for mains
     rows_tracked = df[is_tracked_good].copy().reset_index(drop=True)
     avg_days_col = (
         pd.to_numeric(in_transit_days[is_tracked_good], errors="coerce").astype("Int64").reset_index(drop=True)
@@ -624,6 +631,27 @@ def build_ocean_tables(df_raw: pd.DataFrame):
     main2 = _append_total_row(main2, "Container Number")
 
     return small, main1, main2
+
+# -----------------------------
+# Ocean single CSV (stacked sections)
+# -----------------------------
+def build_ocean_single_csv(small_df: pd.DataFrame, main1_df: pd.DataFrame, main2_df: pd.DataFrame) -> bytes:
+    """
+    Single CSV that contains:
+      - small table header + rows (rows 1–5)
+      - one blank line (row 6)
+      - main table 1 (lane level) header + rows (row 7 onward)
+      - one blank line
+      - main table 2 (container level) header + rows
+    Note: CSV is linear, so mains are stacked, not side-by-side (Excel handles side-by-side).
+    """
+    buf = io.StringIO()
+    small_df.to_csv(buf, index=False)
+    buf.write("\n")  # blank row 6
+    main1_df.to_csv(buf, index=False)
+    buf.write("\n")  # spacer
+    main2_df.to_csv(buf, index=False)
+    return buf.getvalue().encode("utf-8")
 
 # -----------------------------
 # Single, unified UI (no duplicates)
@@ -739,31 +767,50 @@ if uploaded:
             small_df, main1_df, main2_df = build_ocean_tables(df_raw)
             st.success("Summary built successfully.")
 
-            with st.expander("Preview — Small table (rows 1–6)"):
+            with st.expander("Preview — Small table (rows 1–5)"):
                 st.dataframe(small_df, use_container_width=True)
+
             c1, c2 = st.columns(2)
             with c1:
-                st.subheader("Main Table 1 — Lane Level (A–E)")
+                st.subheader("Main Table 1 — Lane Level (A8–E)")
                 st.dataframe(main1_df.head(50), use_container_width=True)
             with c2:
-                st.subheader("Main Table 2 — Container Level (G–N)")
+                st.subheader("Main Table 2 — Container Level (G8–N)")
                 st.dataframe(main2_df.head(50), use_container_width=True)
 
-            # Downloads
+            # ---- DOWNLOADS ----
+            # Single CSV (stacked: small, blank, main1, blank, main2)
+            ocean_csv_blob = build_ocean_single_csv(small_df, main1_df, main2_df)
+            st.download_button(
+                "⬇️ Download Summary (Single CSV)",
+                data=ocean_csv_blob,
+                file_name=f"Summary_{mode}.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+
+            # Excel: small top; Main1 at A8..E, blank F, Main2 at G8..N (side-by-side)
             engine = pick_xlsx_engine()
             if engine:
                 out = io.BytesIO()
                 with pd.ExcelWriter(out, engine=engine) as writer:
-                    small_df.to_excel(writer, sheet_name="Summary", index=False, startrow=0)
-                    main1_df.to_excel(writer, sheet_name="Summary", index=False, startrow=6)
-                    startrow2 = 6 + len(main1_df) + 2
-                    main2_df.to_excel(writer, sheet_name="Summary", index=False, startrow=startrow2)
+                    # Small table at top (rows 1..5)
+                    small_df.to_excel(writer, sheet_name="Summary", index=False, startrow=0, startcol=0)
+
+                    # Main tables from row 8 (index 7). Keep row 6 blank as spacer already because
+                    # small uses rows 1..5 and we start mains at 8.
+                    # Place main1 at columns A..E (startcol=0), main2 at G..N (startcol=6), F blank.
+                    main1_df.to_excel(writer, sheet_name="Summary", index=False, startrow=7, startcol=0)
+                    main2_df.to_excel(writer, sheet_name="Summary", index=False, startrow=7, startcol=6)
+
+                    # Meta
                     pd.DataFrame({"Mode":[mode]}).to_excel(writer, sheet_name="Meta", index=False)
                 out.seek(0)
                 excel_blob = out.getvalue()
             else:
                 excel_blob = None
 
+            # Optional: separate CSVs (lane & container) if you want to keep them
             st.download_button("⬇️ Download Lane-Level (CSV)",
                                data=main1_df.to_csv(index=False).encode("utf-8"),
                                file_name=f"Summary_{mode}_lanes.csv",
@@ -772,6 +819,7 @@ if uploaded:
                                data=main2_df.to_csv(index=False).encode("utf-8"),
                                file_name=f"Summary_{mode}_containers.csv",
                                mime="text/csv", use_container_width=True)
+
             if excel_blob is not None:
                 st.download_button("⬇️ Download Summary (Excel)", data=excel_blob,
                                    file_name=f"Summary_{mode}.xlsx",
