@@ -80,22 +80,13 @@ def round_half_up_days(x):
     return math.floor(x + 0.5)  # e.g., 3.5->4, 3.4->3
 
 def split_city_state(text: str):
-    """Preferred: split on first '-' (city - state). Else try last 2-letter uppercase token as state.
-       Returns (city, state)."""
+    """Preferred: split on first '-' (city - state). Else try last 2-letter uppercase token as state."""
     if is_missing_like(text): return "", ""
     s = str(text).strip()
-
-    # Case 1: explicit dash
     parts = re.split(r"\s*-\s*", s, maxsplit=1)
-    if len(parts) == 2:
-        return parts[0].strip(), parts[1].strip()
-
-    # Case 2: ends with 2-letter state
+    if len(parts) == 2: return parts[0].strip(), parts[1].strip()
     m = re.match(r"^(.*?)[\s,]+([A-Z]{2})$", s)
-    if m:
-        return m.group(1).strip(), m.group(2).strip()
-
-    # Fallback: everything is city
+    if m: return m.group(1).strip(), m.group(2).strip()
     return s, ""
 
 # -----------------------------
@@ -122,13 +113,12 @@ def load_table(uploaded_file) -> pd.DataFrame:
                 sep=None,
                 engine="python",
                 on_bad_lines="skip",
-                dtype=str,              # keep everything as text; we’ll parse what we need
+                dtype=str,
                 keep_default_na=False,
             )
         except Exception:
             continue
 
-    # Last resort try Excel again
     _ensure_pkg("openpyxl", "openpyxl>=3.1.5")
     return pd.read_excel(io.BytesIO(raw_bytes))
 
@@ -149,40 +139,26 @@ FTL_RAW_MAP = {
 }
 
 def build_ftl_tables(df_raw: pd.DataFrame):
-    """Working FTL logic with robust index handling to avoid length mismatches.
-    Root cause previously: mixing Series that kept original indices with list/array
-    columns based on a filtered DataFrame. We now reset indices consistently.
-    """
     df = normalize_headers(df_raw).copy()
+    for _, col in FTL_RAW_MAP.items():
+        if col not in df.columns: df[col] = np.nan
 
-    # Ensure needed columns exist
-    for key, col in FTL_RAW_MAP.items():
-        if col not in df.columns:
-            df[col] = np.nan
-
-    # Convenience Series
     trk   = df[FTL_RAW_MAP["tracked"]]
     dep   = df[FTL_RAW_MAP["pickup_departure_utc"]]
     arr   = df[FTL_RAW_MAP["dropoff_arrival_utc"]]
 
-    # Parse timestamps
     dep_ts = dep.apply(parse_timestamp_utc)
     arr_ts = arr.apply(parse_timestamp_utc)
 
-    # Compute transit days (raw float)
     delta_days = (arr_ts - dep_ts).dt.total_seconds() / (24 * 3600)
     valid_transit = delta_days > 0
-
-    # Rounded days
     in_transit_days = delta_days.apply(lambda x: int(round_half_up_days(x)) if pd.notna(x) else np.nan)
 
-    # Categories (mutually exclusive)
     is_untracked     = trk.apply(is_false_like)
     is_tracked_true  = trk.apply(is_true_like)
     is_missing       = (~is_untracked) & is_tracked_true & (~valid_transit.fillna(False))
     is_tracked_good  = (~is_untracked) & is_tracked_true &  valid_transit.fillna(False)
 
-    # Small summary counts & average
     cnt_untracked = int(is_untracked.sum())
     cnt_missing   = int(is_missing.sum())
     cnt_tracked   = int(is_tracked_good.sum())
@@ -191,7 +167,6 @@ def build_ftl_tables(df_raw: pd.DataFrame):
     tracked_days = in_transit_days.where(is_tracked_good)
     avg_tracked = float(pd.to_numeric(tracked_days, errors="coerce").dropna().mean()) if cnt_tracked > 0 else ""
 
-    # Small table (rows 1–5)
     small = pd.DataFrame({
         "Label": ["Tracked", "Missed Milestone", "Untracked", "Grand Total"],
         "Shipment Count": [cnt_tracked, cnt_missing, cnt_untracked, grand_total],
@@ -200,24 +175,17 @@ def build_ftl_tables(df_raw: pd.DataFrame):
         "Time taken from Departure to Arrival": ["", "", "", ""],
     })
 
-    # === Main table (tracked only) with SAFE index workflow ===
     rows = df[is_tracked_good].copy().reset_index(drop=True)
-
-    # City/state split (based on rows)
     if len(rows):
         p_city, p_state = zip(*rows[FTL_RAW_MAP["p_city_state"]].astype(str).map(split_city_state))
         d_city, d_state = zip(*rows[FTL_RAW_MAP["d_city_state"]].astype(str).map(split_city_state))
     else:
         p_city, p_state, d_city, d_state = ([], [], [], [])
 
-    # Align transit days using the same boolean mask order, then reset index
     avg_days_col = (
-        pd.to_numeric(in_transit_days[is_tracked_good], errors="coerce")
-          .astype("Int64")
-          .reset_index(drop=True)
+        pd.to_numeric(in_transit_days[is_tracked_good], errors="coerce").astype("Int64").reset_index(drop=True)
     ) if cnt_tracked > 0 else pd.Series([], dtype="Int64")
 
-    # Build main with everything length-aligned
     main = pd.DataFrame({
         "Bill of Lading": rows[FTL_RAW_MAP["bol"]].astype(str).str.strip(),
         "Pickup Name": rows[FTL_RAW_MAP["p_name"]].astype(str).str.strip(),
@@ -231,11 +199,7 @@ def build_ftl_tables(df_raw: pd.DataFrame):
         "Average of In-Transit Time": avg_days_col,
     })
 
-    # Append Grand Total average row
-    if len(main) > 0:
-        javg = float(pd.to_numeric(main["Average of In-Transit Time"], errors="coerce").dropna().mean())
-    else:
-        javg = ""
+    javg = float(pd.to_numeric(main["Average of In-Transit Time"], errors="coerce").dropna().mean()) if len(main) else ""
     total_row = {col: "" for col in main.columns}
     total_row["Bill of Lading"] = "Grand Total"
     total_row["Average of In-Transit Time"] = javg
@@ -244,7 +208,7 @@ def build_ftl_tables(df_raw: pd.DataFrame):
     return small, main
 
 # =============================
-# LTL (as per your detailed spec, unchanged)
+# LTL
 # =============================
 LTL_MAP = {
     "pro": "PRO number",
@@ -263,33 +227,25 @@ LTL_MAP = {
 
 def build_ltl_tables(df_raw: pd.DataFrame):
     df = normalize_headers(df_raw).copy()
-
-    # Ensure needed columns exist (create blanks if missing)
-    needed_cols = [
+    for col in [
         LTL_MAP["pro"], LTL_MAP["tracked"], LTL_MAP["p_name"], LTL_MAP["p_city_state"], LTL_MAP["p_region"],
         LTL_MAP["dest_name"], LTL_MAP["d_city_state"], LTL_MAP["d_region"], LTL_MAP["start_ts"], LTL_MAP["end_ts"]
-    ]
-    for col in needed_cols:
-        if col not in df.columns:
-            df[col] = np.nan
+    ]:
+        if col not in df.columns: df[col] = np.nan
 
     trk = df[LTL_MAP["tracked"]]
-
     dep_ts = df[LTL_MAP["start_ts"]].apply(parse_timestamp_utc)
     arr_ts = df[LTL_MAP["end_ts"]].apply(parse_timestamp_utc)
 
-    # Delta and rounding
     delta_days = (arr_ts - dep_ts).dt.total_seconds() / (24 * 3600)
     valid_transit = delta_days > 0
     in_transit_days = delta_days.apply(lambda x: int(round_half_up_days(x)) if pd.notna(x) else np.nan)
 
-    # Categories per your rules
     is_untracked     = trk.apply(is_false_like)
     is_tracked_true  = trk.apply(is_true_like)
     is_missing       = (~is_untracked) & is_tracked_true & (~valid_transit.fillna(False))
     is_tracked_good  = (~is_untracked) & is_tracked_true &  valid_transit.fillna(False)
 
-    # Small summary counts & average
     cnt_untracked = int(is_untracked.sum())
     cnt_missing   = int(is_missing.sum())
     cnt_tracked   = int(is_tracked_good.sum())
@@ -306,9 +262,7 @@ def build_ltl_tables(df_raw: pd.DataFrame):
         LTL_MAP["def_col_e"]: ["", "", "", ""],
     })
 
-    # Main table (tracked only) — SAFE index workflow
     rows = df[is_tracked_good].copy().reset_index(drop=True)
-
     if len(rows):
         p_city, p_state = zip(*rows[LTL_MAP["p_city_state"]].astype(str).map(split_city_state))
         d_city, d_state = zip(*rows[LTL_MAP["d_city_state"]].astype(str).map(split_city_state))
@@ -316,9 +270,7 @@ def build_ltl_tables(df_raw: pd.DataFrame):
         p_city, p_state, d_city, d_state = ([], [], [], [])
 
     avg_days_col = (
-        pd.to_numeric(in_transit_days[is_tracked_good], errors="coerce")
-          .astype("Int64")
-          .reset_index(drop=True)
+        pd.to_numeric(in_transit_days[is_tracked_good], errors="coerce").astype("Int64").reset_index(drop=True)
     ) if cnt_tracked > 0 else pd.Series([], dtype="Int64")
 
     main = pd.DataFrame({
@@ -334,11 +286,7 @@ def build_ltl_tables(df_raw: pd.DataFrame):
         "Average of In-Transit Time": avg_days_col,
     })
 
-    # Grand Total avg row
-    if len(main) > 0:
-        javg = float(pd.to_numeric(main["Average of In-Transit Time"], errors="coerce").dropna().mean())
-    else:
-        javg = ""
+    javg = float(pd.to_numeric(main["Average of In-Transit Time"], errors="coerce").dropna().mean()) if len(main) else ""
     total_row = {col: "" for col in main.columns}
     total_row["Pro Number"] = "Grand Total"
     total_row["Average of In-Transit Time"] = javg
@@ -351,8 +299,7 @@ def build_ltl_tables(df_raw: pd.DataFrame):
 # -----------------------------
 def build_summary_excel(small_df: pd.DataFrame, main_df: pd.DataFrame, mode_name: str) -> bytes | None:
     engine = pick_xlsx_engine()
-    if not engine:
-        return None
+    if not engine: return None
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine=engine) as writer:
         small_df.to_excel(writer, sheet_name="Summary", index=False, startrow=0)
@@ -362,20 +309,14 @@ def build_summary_excel(small_df: pd.DataFrame, main_df: pd.DataFrame, mode_name
     return out.getvalue()
 
 def build_summary_single_csv(small_df: pd.DataFrame, main_df: pd.DataFrame) -> bytes:
-    """
-    Creates one CSV with:
-      - small table header + rows
-      - one blank line (row 6)
-      - main table header + rows (from row 7)
-    """
     buf = io.StringIO()
     small_df.to_csv(buf, index=False)
-    buf.write("\n")  # blank row 6
+    buf.write("\n")
     main_df.to_csv(buf, index=False)
     return buf.getvalue().encode("utf-8")
 
 # =============================
-# PARCEL (new product)
+# PARCEL
 # =============================
 PARCEL_MAP = {
     "shipment_id": "Shipment ID",
@@ -411,48 +352,33 @@ PARCEL_MAP = {
     "final_status_reason": "Final Status Reason",
 }
 
-# treat '0' or 0 as missing (specific to Parcel/Ocean timestamps)
 def _parse_ts_zero_ok(x):
-    if pd.isna(x):
-        return pd.NaT
-    if (isinstance(x, str) and x.strip() == "0"):
-        return pd.NaT
-    if isinstance(x, (int, float)) and float(x) == 0.0:
-        return pd.NaT
+    """Treat '0' or 0 as missing; otherwise parse to UTC."""
+    if pd.isna(x): return pd.NaT
+    if isinstance(x, str) and x.strip() == "0": return pd.NaT
+    if isinstance(x, (int, float)) and float(x) == 0.0: return pd.NaT
     return pd.to_datetime(x, utc=True, errors="coerce")
-
 
 def build_parcel_tables(df_raw: pd.DataFrame):
     df = normalize_headers(df_raw).copy()
+    for _, col in PARCEL_MAP.items():
+        if col not in df.columns: df[col] = np.nan
 
-    # ensure needed columns exist
-    for key, col in PARCEL_MAP.items():
-        if col not in df.columns:
-            df[col] = np.nan
-
-    trk = df[PARCEL_MAP["tracked"]]
-
+    trk    = df[PARCEL_MAP["tracked"]]
     dep_ts = df[PARCEL_MAP["departed_ts"]].apply(_parse_ts_zero_ok)
     arr_ts = df[PARCEL_MAP["delivered_ts"]].apply(_parse_ts_zero_ok)
 
-    # compute delta
     delta_days = (arr_ts - dep_ts).dt.total_seconds() / (24 * 3600)
-
-    # classification
-    is_untracked    = trk.apply(is_false_like)  # only explicit False counts as Untracked
-    is_tracked_true = trk.apply(is_true_like)
-
-    # missing if negative delta OR either ts missing
     ts_missing = dep_ts.isna() | arr_ts.isna()
     valid_transit = (delta_days > 0) & (~ts_missing)
 
-    is_missing = (~is_untracked) & is_tracked_true & (~valid_transit)
-    is_tracked_good = (~is_untracked) & is_tracked_true & valid_transit
+    is_untracked    = trk.apply(is_false_like)
+    is_tracked_true = trk.apply(is_true_like)
+    is_missing      = (~is_untracked) & is_tracked_true & (~valid_transit)
+    is_tracked_good = (~is_untracked) & is_tracked_true &  valid_transit
 
-    # rounded days
     in_transit_days = delta_days.apply(lambda x: int(round_half_up_days(x)) if pd.notna(x) else np.nan)
 
-    # counts & avg
     cnt_untracked = int(is_untracked.sum())
     cnt_missing   = int(is_missing.sum())
     cnt_tracked   = int(is_tracked_good.sum())
@@ -461,7 +387,6 @@ def build_parcel_tables(df_raw: pd.DataFrame):
     tracked_days = in_transit_days.where(is_tracked_good)
     avg_tracked = float(pd.to_numeric(tracked_days, errors="coerce").dropna().mean()) if cnt_tracked > 0 else ""
 
-    # Small table
     small = pd.DataFrame({
         "Label": ["Tracked", "Untracked", "Missed Milestone", "Grand Total"],
         "Shipment Count": [cnt_tracked, cnt_untracked, cnt_missing, grand_total],
@@ -470,13 +395,9 @@ def build_parcel_tables(df_raw: pd.DataFrame):
         "Time taken from Departure to Delivered": ["", "", "", ""],
     })
 
-    # Main table for tracked shipments only
     rows = df[is_tracked_good].copy().reset_index(drop=True)
-
     avg_days_col = (
-        pd.to_numeric(in_transit_days[is_tracked_good], errors="coerce")
-          .astype("Int64")
-          .reset_index(drop=True)
+        pd.to_numeric(in_transit_days[is_tracked_good], errors="coerce").astype("Int64").reset_index(drop=True)
     ) if cnt_tracked > 0 else pd.Series([], dtype="Int64")
 
     main = pd.DataFrame({
@@ -488,11 +409,7 @@ def build_parcel_tables(df_raw: pd.DataFrame):
         "Average of In-Transit Time": avg_days_col,
     })
 
-    # Append Grand Total avg row
-    if len(main) > 0:
-        javg = float(pd.to_numeric(main["Average of In-Transit Time"], errors="coerce").dropna().mean())
-    else:
-        javg = ""
+    javg = float(pd.to_numeric(main["Average of In-Transit Time"], errors="coerce").dropna().mean()) if len(main) else ""
     total_row = {col: "" for col in main.columns}
     total_row["Tracking Number"] = "Grand Total"
     total_row["Average of In-Transit Time"] = javg
@@ -501,7 +418,7 @@ def build_parcel_tables(df_raw: pd.DataFrame):
     return small, main
 
 # =============================
-# OCEAN (new product)
+# OCEAN
 # =============================
 OCEAN_MAP = {
     "tenant_name": "Tenant Name",
@@ -566,20 +483,14 @@ INTERMEDIATE_TS_FOR_INTRANSIT = [
     OCEAN_MAP["container_discharge"],
 ]
 
-
 def build_ocean_tables(df_raw: pd.DataFrame):
     df = normalize_headers(df_raw).copy()
+    for _, col in OCEAN_MAP.items():
+        if col not in df.columns: df[col] = np.nan
 
-    # ensure needed columns exist
-    for key, col in OCEAN_MAP.items():
-        if col not in df.columns:
-            df[col] = np.nan
-
-    # Parse timestamps with '0' treated as missing
     gate_in_ts  = df[OCEAN_MAP["gate_in"]].apply(_parse_ts_zero_ok)
     gate_out_ts = df[OCEAN_MAP["gate_out"]].apply(_parse_ts_zero_ok)
 
-    # For untracked: ALL of the specified milestones must be empty/0
     all_empty_mask = pd.Series(True, index=df.index)
     for col in OCEAN_TS_ALL_FOR_UNTRACKED:
         col_ts = df[col].apply(_parse_ts_zero_ok)
@@ -587,7 +498,6 @@ def build_ocean_tables(df_raw: pd.DataFrame):
 
     lifecycle_status = df[OCEAN_MAP["lifecycle_status"]].astype(str).str.strip().str.lower()
 
-    # Compute delta and helpers
     delta_days = (gate_out_ts - gate_in_ts).dt.total_seconds() / (24 * 3600)
     delta_pos  = delta_days > 0
     delta_neg  = delta_days < 0
@@ -597,49 +507,34 @@ def build_ocean_tables(df_raw: pd.DataFrame):
     gate_out_present  = ~gate_out_ts.isna()
     gate_out_missing  = gate_out_ts.isna()
 
-    # Any intermediate present?
     any_intermediate_present = pd.Series(False, index=df.index)
     for col in INTERMEDIATE_TS_FOR_INTRANSIT:
         any_intermediate_present |= ~df[col].apply(_parse_ts_zero_ok).isna()
 
-    # === Category masks (mutually exclusive) ===
-    # 1) UNTRACKED: all milestones empty
+    # 1) Untracked
     is_untracked = all_empty_mask
 
-    # 2) TRACKED: positive delta (Gate Out - Gate In > 0)
+    # 2) Tracked (positive delta)
     is_tracked_good = delta_pos & (~is_untracked)
 
-    # 3) IN-TRANSIT per rules
-    #   d1) both Gate In & Gate Out missing, but ANY intermediate present & Lifecycle Active
+    # 3) In-Transit:
     both_missing = gate_in_missing & gate_out_missing
     lifecycle_active = lifecycle_status.eq("active")
     intransit_case_d1 = both_missing & any_intermediate_present & lifecycle_active
-
-    #   d2) Gate In present & Gate Out missing, and ANY intermediate present
     intransit_case_d2 = gate_in_present & gate_out_missing & any_intermediate_present
-
-    #   d3) Gate In present & Gate Out missing & NO intermediate present, but Lifecycle Active
     intransit_case_d3 = gate_in_present & gate_out_missing & (~any_intermediate_present) & lifecycle_active
-
     is_in_transit = (intransit_case_d1 | intransit_case_d2 | intransit_case_d3) & (~is_untracked) & (~is_tracked_good)
 
-    # 4) MISSING MILESTONE per rules
-    #   b) negative delta
-    #   c) Gate Out present & Gate In missing
-    #   d1-fallback) both missing & any intermediate present & lifecycle not active
-    #   d2-fallback) Gate In present & Gate Out missing & NO intermediate present & lifecycle not active
+    # 4) Missing:
     missing_case_b  = delta_neg
     missing_case_c  = gate_out_present & gate_in_missing
     missing_case_d1 = both_missing & any_intermediate_present & (~lifecycle_active)
     missing_case_d2 = gate_in_present & gate_out_missing & (~any_intermediate_present) & (~lifecycle_active)
-
     is_missing = (missing_case_b | missing_case_c | missing_case_d1 | missing_case_d2)
     is_missing = is_missing & (~is_untracked) & (~is_tracked_good) & (~is_in_transit)
 
-    # Rounded days for tracked rows
     in_transit_days = delta_days.apply(lambda x: int(round_half_up_days(x)) if pd.notna(x) else np.nan)
 
-    # Counts
     cnt_untracked   = int(is_untracked.sum())
     cnt_in_transit  = int(is_in_transit.sum())
     cnt_missing     = int(is_missing.sum())
@@ -649,7 +544,6 @@ def build_ocean_tables(df_raw: pd.DataFrame):
     tracked_days = in_transit_days.where(is_tracked_good)
     avg_tracked = float(pd.to_numeric(tracked_days, errors="coerce").dropna().mean()) if cnt_tracked > 0 else ""
 
-    # Small table (rows 1–6)
     small = pd.DataFrame({
         "Label": [
             "Tracked",
@@ -670,15 +564,12 @@ def build_ocean_tables(df_raw: pd.DataFrame):
         "Time taken from Gate In to Gate Out": ["", "", "", "", ""],
     })
 
-    # === Main tables (tracked only) ===
     rows_tracked = df[is_tracked_good].copy().reset_index(drop=True)
-
     avg_days_col = (
-        pd.to_numeric(in_transit_days[is_tracked_good], errors="coerce")
-          .astype("Int64")
-          .reset_index(drop=True)
+        pd.to_numeric(in_transit_days[is_tracked_good], errors="coerce").astype("Int64").reset_index(drop=True)
     ) if cnt_tracked > 0 else pd.Series([], dtype="Int64")
 
+    # Main Table 2 — Container level (G–N)
     main2 = pd.DataFrame({
         "Container Number": rows_tracked[OCEAN_MAP["container_number"]].astype(str).str.strip(),
         "Request Key": rows_tracked[OCEAN_MAP["request_key"]].astype(str).str.strip(),
@@ -690,17 +581,14 @@ def build_ocean_tables(df_raw: pd.DataFrame):
         "D2D Avg Transit Time": (avg_days_col.astype("float") + 7).astype("Int64"),
     })
 
-    # Lane-level main (Table 1)
+    # Main Table 1 — Lane level (A–E)
     if cnt_tracked > 0 and len(rows_tracked) > 0:
         lanes = rows_tracked[[OCEAN_MAP["pol"], OCEAN_MAP["pod"]]].copy()
         lanes.columns = ["Pol", "Pod"]
         lanes["Average of In-Transit Time"] = avg_days_col.astype("float")
         lane_agg = (
             lanes.groupby(["Pol", "Pod"], dropna=False)["Average of In-Transit Time"]
-                 .mean()
-                 .round()
-                 .astype("Int64")
-                 .reset_index()
+                 .mean().round().astype("Int64").reset_index()
         )
     else:
         lane_agg = pd.DataFrame({
@@ -712,16 +600,18 @@ def build_ocean_tables(df_raw: pd.DataFrame):
     main1 = lane_agg.copy()
     if len(main1) > 0:
         main1["Add 7 Days D2D"] = 7
-        main1["D2D Avg Transit Time"] = (pd.to_numeric(main1["Average of In-Transit Time"], errors="coerce").astype(float) + 7).round().astype("Int64")
+        main1["D2D Avg Transit Time"] = (
+            pd.to_numeric(main1["Average of In-Transit Time"], errors="coerce").astype(float) + 7
+        ).round().astype("Int64")
     else:
         main1["Add 7 Days D2D"] = pd.Series(dtype="Int64")
         main1["D2D Avg Transit Time"] = pd.Series(dtype="Int64")
 
     # Append Grand Total avg row to both mains
     def _append_total_row(df_in: pd.DataFrame, first_label_col: str):
-        if len(df_in) == 0:
-            return df_in
-        javg = float(pd.to_numeric(df_in["Average of In-Transit Time"], errors="coerce").dropna().mean()) if "Average of In-Transit Time" in df_in.columns else ""
+        if len(df_in) == 0: return df_in
+        javg = float(pd.to_numeric(df_in["Average of In-Transit Time"], errors="coerce").dropna().mean()) \
+               if "Average of In-Transit Time" in df_in.columns else ""
         total = {col: "" for col in df_in.columns}
         total[first_label_col] = "Grand Total"
         total["Average of In-Transit Time"] = javg
@@ -736,128 +626,107 @@ def build_ocean_tables(df_raw: pd.DataFrame):
     return small, main1, main2
 
 # -----------------------------
-# UI
+# Single, unified UI (no duplicates)
 # -----------------------------
 mode = st.selectbox(
     "Choose Product",
     options=["FTL", "LTL", "Parcel", "Ocean"],
     index=0,
-    help=(
-        "FTL uses original working logic; LTL uses Pickup→Delivered timestamps and PRO/Region fields; "
-        "Parcel uses Departed→Delivered (0 treated as missing); Ocean uses Gate In→Gate Out with lane- and container-level mains."
-    )
+    help=("FTL uses original working logic; LTL uses Pickup→Delivered; "
+          "Parcel uses Departed→Delivered (0 treated as missing); "
+          "Ocean uses Gate In→Gate Out with lane- and container-level mains."),
+    key="mode_select"
 )
 
-uploaded = st.file_uploader("Upload RAW file (CSV or Excel)", type=["csv", "xlsx", "xls"], accept_multiple_files=False)
+uploaded = st.file_uploader(
+    "Upload RAW file (CSV or Excel)",
+    type=["csv", "xlsx", "xls"],
+    accept_multiple_files=False,
+    key="uploader_main"
+)
 st.caption(f"Selected: **{mode}**")
 
 if uploaded:
     try:
         df_raw = load_table(uploaded)
         st.write(f"**Rows loaded:** {len(df_raw):,} | **Columns:** {len(df_raw.columns)}")
+
         if mode == "FTL":
             small_df, main_df = build_ftl_tables(df_raw)
             st.success("Summary built successfully.")
-
             with st.expander("Preview — Small table (rows 1–5)"):
                 st.dataframe(small_df, use_container_width=True)
             with st.expander("Preview — Main table (row 7 onward)"):
                 st.dataframe(main_df.head(50), use_container_width=True)
 
             single_csv_blob = build_summary_single_csv(small_df, main_df)
-            st.download_button(
-                "⬇️ Download Summary (Single CSV)",
-                data=single_csv_blob,
-                file_name=f"Summary_{mode}.csv",
-                mime="text/csv",
-                use_container_width=True
-            )
+            st.download_button("⬇️ Download Summary (Single CSV)", data=single_csv_blob,
+                               file_name=f"Summary_{mode}.csv", mime="text/csv", use_container_width=True)
 
             excel_blob = build_summary_excel(small_df, main_df, mode)
             if excel_blob is not None:
-                st.download_button(
-                    "⬇️ Download Summary (Excel)",
-                    data=excel_blob,
-                    file_name=f"Summary_{mode}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
-                )
+                st.download_button("⬇️ Download Summary (Excel)", data=excel_blob,
+                                   file_name=f"Summary_{mode}.xlsx",
+                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                   use_container_width=True)
             else:
-                st.info("Excel engine unavailable; CSV export works. Add `openpyxl` or `xlsxwriter` in requirements to enable Excel.")
+                st.info("Excel engine unavailable; CSV export works. Add `openpyxl` or `xlsxwriter`.")
 
             st.caption(
                 f"Counts — Tracked: {int(small_df.loc[0, 'Shipment Count'])}, "
-                f"Untracked: {int(small_df.loc[1, 'Shipment Count'])}, "
-                f"Missed: {int(small_df.loc[2, 'Shipment Count'])}, "
+                f"Missed: {int(small_df.loc[1, 'Shipment Count'])}, "
+                f"Untracked: {int(small_df.loc[2, 'Shipment Count'])}, "
                 f"Total: {int(small_df.loc[3, 'Shipment Count'])}"
             )
 
         elif mode == "LTL":
             small_df, main_df = build_ltl_tables(df_raw)
             st.success("Summary built successfully.")
-
             with st.expander("Preview — Small table (rows 1–5)"):
                 st.dataframe(small_df, use_container_width=True)
             with st.expander("Preview — Main table (row 7 onward)"):
                 st.dataframe(main_df.head(50), use_container_width=True)
 
             single_csv_blob = build_summary_single_csv(small_df, main_df)
-            st.download_button(
-                "⬇️ Download Summary (Single CSV)",
-                data=single_csv_blob,
-                file_name=f"Summary_{mode}.csv",
-                mime="text/csv",
-                use_container_width=True
-            )
+            st.download_button("⬇️ Download Summary (Single CSV)", data=single_csv_blob,
+                               file_name=f"Summary_{mode}.csv", mime="text/csv", use_container_width=True)
 
             excel_blob = build_summary_excel(small_df, main_df, mode)
             if excel_blob is not None:
-                st.download_button(
-                    "⬇️ Download Summary (Excel)",
-                    data=excel_blob,
-                    file_name=f"Summary_{mode}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
-                )
+                st.download_button("⬇️ Download Summary (Excel)", data=excel_blob,
+                                   file_name=f"Summary_{mode}.xlsx",
+                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                   use_container_width=True)
             else:
-                st.info("Excel engine unavailable; CSV export works. Add `openpyxl` or `xlsxwriter` in requirements to enable Excel.")
+                st.info("Excel engine unavailable; CSV export works. Add `openpyxl` or `xlsxwriter`.")
 
             st.caption(
                 f"Counts — Tracked: {int(small_df.loc[0, 'Shipment Count'])}, "
-                f"Untracked: {int(small_df.loc[2, 'Shipment Count']) if 'Untracked' in list(small_df['Label']) else 0}, "
-                f"Missed: {int(small_df.loc[1, 'Shipment Count']) if 'Missed Milestone' in list(small_df['Label']) else 0}, "
+                f"Missed: {int(small_df.loc[1, 'Shipment Count'])}, "
+                f"Untracked: {int(small_df.loc[2, 'Shipment Count'])}, "
                 f"Total: {int(small_df.loc[3, 'Shipment Count'])}"
             )
 
         elif mode == "Parcel":
             small_df, main_df = build_parcel_tables(df_raw)
             st.success("Summary built successfully.")
-
             with st.expander("Preview — Small table (rows 1–5)"):
                 st.dataframe(small_df, use_container_width=True)
             with st.expander("Preview — Main table (row 7 onward)"):
                 st.dataframe(main_df.head(50), use_container_width=True)
 
             single_csv_blob = build_summary_single_csv(small_df, main_df)
-            st.download_button(
-                "⬇️ Download Summary (Single CSV)",
-                data=single_csv_blob,
-                file_name=f"Summary_{mode}.csv",
-                mime="text/csv",
-                use_container_width=True
-            )
+            st.download_button("⬇️ Download Summary (Single CSV)", data=single_csv_blob,
+                               file_name=f"Summary_{mode}.csv", mime="text/csv", use_container_width=True)
 
             excel_blob = build_summary_excel(small_df, main_df, mode)
             if excel_blob is not None:
-                st.download_button(
-                    "⬇️ Download Summary (Excel)",
-                    data=excel_blob,
-                    file_name=f"Summary_{mode}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
-                )
+                st.download_button("⬇️ Download Summary (Excel)", data=excel_blob,
+                                   file_name=f"Summary_{mode}.xlsx",
+                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                   use_container_width=True)
             else:
-                st.info("Excel engine unavailable; CSV export works. Add `openpyxl` or `xlsxwriter` in requirements to enable Excel.")
+                st.info("Excel engine unavailable; CSV export works. Add `openpyxl` or `xlsxwriter`.")
 
             st.caption(
                 f"Counts — Tracked: {int(small_df.loc[0, 'Shipment Count'])}, "
@@ -881,50 +750,35 @@ if uploaded:
                 st.dataframe(main2_df.head(50), use_container_width=True)
 
             # Downloads
-            # Excel writer will place both mains on the same 'Summary' sheet sequentially
             engine = pick_xlsx_engine()
             if engine:
                 out = io.BytesIO()
                 with pd.ExcelWriter(out, engine=engine) as writer:
-                    # small at top
                     small_df.to_excel(writer, sheet_name="Summary", index=False, startrow=0)
-                    # leave row 6 blank, main1 from row 7 (index 6)
                     main1_df.to_excel(writer, sheet_name="Summary", index=False, startrow=6)
-                    # leave a blank row between main1 and main2
                     startrow2 = 6 + len(main1_df) + 2
                     main2_df.to_excel(writer, sheet_name="Summary", index=False, startrow=startrow2)
-                    # meta
                     pd.DataFrame({"Mode":[mode]}).to_excel(writer, sheet_name="Meta", index=False)
                 out.seek(0)
                 excel_blob = out.getvalue()
             else:
                 excel_blob = None
 
-            # CSVs
-            st.download_button(
-                "⬇️ Download Lane-Level (CSV)",
-                data=main1_df.to_csv(index=False).encode("utf-8"),
-                file_name=f"Summary_{mode}_lanes.csv",
-                mime="text/csv",
-                use_container_width=True
-            )
-            st.download_button(
-                "⬇️ Download Container-Level (CSV)",
-                data=main2_df.to_csv(index=False).encode("utf-8"),
-                file_name=f"Summary_{mode}_containers.csv",
-                mime="text/csv",
-                use_container_width=True
-            )
+            st.download_button("⬇️ Download Lane-Level (CSV)",
+                               data=main1_df.to_csv(index=False).encode("utf-8"),
+                               file_name=f"Summary_{mode}_lanes.csv",
+                               mime="text/csv", use_container_width=True)
+            st.download_button("⬇️ Download Container-Level (CSV)",
+                               data=main2_df.to_csv(index=False).encode("utf-8"),
+                               file_name=f"Summary_{mode}_containers.csv",
+                               mime="text/csv", use_container_width=True)
             if excel_blob is not None:
-                st.download_button(
-                    "⬇️ Download Summary (Excel)",
-                    data=excel_blob,
-                    file_name=f"Summary_{mode}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
-                )
+                st.download_button("⬇️ Download Summary (Excel)", data=excel_blob,
+                                   file_name=f"Summary_{mode}.xlsx",
+                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                   use_container_width=True)
             else:
-                st.info("Excel engine unavailable; CSV exports work. Add `openpyxl` or `xlsxwriter` in requirements to enable Excel.")
+                st.info("Excel engine unavailable; CSV exports work. Add `openpyxl` or `xlsxwriter`.")
 
             st.caption(
                 f"Counts — Tracked: {int(small_df.loc[0, 'Shipment Count'])}, "
@@ -933,71 +787,6 @@ if uploaded:
                 f"In Transit: {int(small_df.loc[3, 'Shipment Count'])}, "
                 f"Total: {int(small_df.loc[4, 'Shipment Count'])}"
             )
-
-    except Exception as e:
-        st.error(f"Could not process this file. Details: {e}")
-else:
-    st.info("Upload your CSV/XLSX to generate the Summary.")
-# -----------------------------
-# UI
-# -----------------------------
-mode = st.selectbox(
-    "Choose Product",
-    options=["FTL", "LTL", "Parcel"],
-    index=0,
-    help="FTL uses original working logic; LTL uses Pickup→Delivered timestamps and PRO/Region fields; Parcel uses Departed→Delivered (0 treated as missing)."
-)
-
-uploaded = st.file_uploader("Upload RAW file (CSV or Excel)", type=["csv", "xlsx", "xls"], accept_multiple_files=False)
-st.caption(f"Selected: **{mode}**")
-
-if uploaded:
-    try:
-        df_raw = load_table(uploaded)
-        st.write(f"**Rows loaded:** {len(df_raw):,} | **Columns:** {len(df_raw.columns)}")
-        if mode == "FTL":
-            small_df, main_df = build_ftl_tables(df_raw)
-        elif mode == "LTL":
-            small_df, main_df = build_ltl_tables(df_raw)
-        else:
-            small_df, main_df = build_parcel_tables(df_raw)
-
-        st.success("Summary built successfully.")
-
-        with st.expander("Preview — Small table (rows 1–5)"):
-            st.dataframe(small_df, use_container_width=True)
-        with st.expander("Preview — Main table (row 7 onward)"):
-            st.dataframe(main_df.head(50), use_container_width=True)
-
-        # Single CSV (both tables together)
-        single_csv_blob = build_summary_single_csv(small_df, main_df)
-        st.download_button(
-            "⬇️ Download Summary (Single CSV)",
-            data=single_csv_blob,
-            file_name=f"Summary_{mode}.csv",
-            mime="text/csv",
-            use_container_width=True
-        )
-
-        # Excel (one sheet "Summary")
-        excel_blob = build_summary_excel(small_df, main_df, mode)
-        if excel_blob is not None:
-            st.download_button(
-                "⬇️ Download Summary (Excel)",
-                data=excel_blob,
-                file_name=f"Summary_{mode}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True
-            )
-        else:
-            st.info("Excel engine unavailable; CSV export works. Add `openpyxl` or `xlsxwriter` in requirements to enable Excel.")
-
-        st.caption(
-            f"Counts — Tracked: {int(small_df.loc[0, 'Shipment Count'])}, "
-            f"Untracked: {int(small_df.loc[1, 'Shipment Count']) if 'Untracked' in list(small_df['Label']) else int(small_df.loc[2, 'Shipment Count'])}, "
-            f"Missed: {int(small_df.loc[2, 'Shipment Count']) if 'Missed Milestone' in list(small_df['Label']) else int(small_df.loc[1, 'Shipment Count'])}, "
-            f"Total: {int(small_df.loc[3, 'Shipment Count'])}"
-        )
 
     except Exception as e:
         st.error(f"Could not process this file. Details: {e}")
