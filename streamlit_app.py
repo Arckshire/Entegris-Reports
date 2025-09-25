@@ -11,7 +11,7 @@ import streamlit as st
 # App meta
 # -----------------------------
 st.set_page_config(page_title="In Transit Time Report Generator", page_icon="📦", layout="wide")
-st.title("In Transit Time Report Generator")")
+st.title("In Transit Time Report Generator")
 
 # -----------------------------
 # Dependency helper for Excel
