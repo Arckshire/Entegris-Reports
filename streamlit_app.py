@@ -616,7 +616,7 @@ def build_ocean_single_csv(small_df: pd.DataFrame, main1_df: pd.DataFrame, main2
     return buf.getvalue().encode("utf-8")
 
 # =============================
-# AIR (new)
+# AIR (fixed)
 # =============================
 AIR_MAP = {
     "carrier_scac": "Carrier Scac",
@@ -645,12 +645,13 @@ def build_air_tables(df_raw: pd.DataFrame):
     df = normalize_headers(df_raw).copy()
     # Ensure columns exist
     for _, col in AIR_MAP.items():
-        if col not in df.columns: df[col] = np.nan
+        if col not in df.columns:
+            df[col] = np.nan
 
     # Parse timestamps (treat '0' as missing)
-    m3 = df[AIR_MAP["m3_ready"]].apply(_parse_ts_zero_ok)
-    m8 = df[AIR_MAP["m8_rcf"]].apply(_parse_ts_zero_ok)
-    m9 = df[AIR_MAP["m9_hold"]].apply(_parse_ts_zero_ok)
+    m3  = df[AIR_MAP["m3_ready"]].apply(_parse_ts_zero_ok)
+    m8  = df[AIR_MAP["m8_rcf"]].apply(_parse_ts_zero_ok)
+    m9  = df[AIR_MAP["m9_hold"]].apply(_parse_ts_zero_ok)
     m10 = df[AIR_MAP["m10_clear"]].apply(_parse_ts_zero_ok)
     m11 = df[AIR_MAP["m11_notified"]].apply(_parse_ts_zero_ok)
     m12 = df[AIR_MAP["m12_delivered"]].apply(_parse_ts_zero_ok)
@@ -659,19 +660,28 @@ def build_air_tables(df_raw: pd.DataFrame):
     all_empty_six = m3.isna() & m8.isna() & m9.isna() & m10.isna() & m11.isna() & m12.isna()
     is_untracked = all_empty_six
 
-    # Choose end timestamp: M12 -> M11 -> M10 -> M9 -> M8
-    ends_df = pd.DataFrame({"m12": m12, "m11": m11, "m10": m10, "m9": m9, "m8": m8})
-    end_ts = ends_df.bfill(axis=1).iloc[:, 0]  # first non-missing across the priority order
+    # Pick the first available end timestamp (M12 -> M11 -> M10 -> M9 -> M8) in a way that
+    # guarantees a Pandas Series (not a NumPy array), then coerce to datetime64[ns, UTC]
+    end_ts = (
+        m12
+        .combine_first(m11)
+        .combine_first(m10)
+        .combine_first(m9)
+        .combine_first(m8)
+    )
+    end_ts  = pd.to_datetime(end_ts, utc=True, errors="coerce")
+    start_ts = pd.to_datetime(m3,   utc=True, errors="coerce")
 
-    start_ts = m3
-    delta_days = (end_ts - start_ts).dt.total_seconds() / (24 * 3600)
+    # Delta (days)
+    delta = end_ts - start_ts
+    delta_days = delta.dt.total_seconds() / (24 * 3600)
 
     # Cases
-    delta_pos = (delta_days > 0)
-    delta_neg = (delta_days < 0)
-    start_missing = start_ts.isna()
+    delta_pos = delta_days > 0
+    delta_neg = delta_days < 0
+    start_missing   = start_ts.isna()
     any_end_present = ~(m8.isna() & m9.isna() & m10.isna() & m11.isna() & m12.isna())
-    all_ends_missing = ~any_end_present  # i.e., all M8..M12 missing
+    all_ends_missing = ~any_end_present
 
     # Tracked: positive delta and not untracked
     is_tracked_good = delta_pos & (~is_untracked)
@@ -687,7 +697,7 @@ def build_air_tables(df_raw: pd.DataFrame):
     )
     is_missing = is_missing & (~is_untracked) & (~is_tracked_good)
 
-    # Round per-row transit days for tracked rows
+    # Per-row rounded transit days for tracked rows
     per_row_days = delta_days.apply(lambda x: int(round_half_up_days(x)) if pd.notna(x) else np.nan)
     tracked_days = per_row_days.where(is_tracked_good)
 
@@ -743,6 +753,7 @@ def build_air_tables(df_raw: pd.DataFrame):
     main = pd.concat([main, pd.DataFrame([total_row])], ignore_index=True)
 
     return small, main
+
 
 # Single CSV for Air
 def build_air_single_csv(small_df: pd.DataFrame, main_df: pd.DataFrame) -> bytes:
