@@ -32,7 +32,7 @@ def _ensure_pkg(pkg_name, spec=None) -> bool:
 def pick_xlsx_engine() -> str:
     if _ensure_pkg("xlsxwriter", "xlsxwriter>=3.2.0"): return "xlsxwriter"
     if _ensure_pkg("openpyxl",  "openpyxl>=3.1.5"):    return "openpyxl"
-    return ""  # neither available
+    return ""
 
 # -----------------------------
 # Parsing helpers
@@ -77,7 +77,7 @@ def parse_timestamp_utc(s):
 
 def round_half_up_days(x):
     if pd.isna(x): return np.nan
-    return math.floor(x + 0.5)  # 3.5->4, 3.4->3
+    return math.floor(x + 0.5)
 
 def split_city_state(text: str):
     if is_missing_like(text): return "", ""
@@ -88,7 +88,6 @@ def split_city_state(text: str):
     if m: return m.group(1).strip(), m.group(2).strip()
     return s, ""
 
-# Treat '0' as missing for modes that need it (Parcel, Ocean, Air)
 def _parse_ts_zero_ok(x):
     if pd.isna(x): return pd.NaT
     if isinstance(x, str) and x.strip() == "0": return pd.NaT
@@ -96,7 +95,7 @@ def _parse_ts_zero_ok(x):
     return pd.to_datetime(x, utc=True, errors="coerce")
 
 # -----------------------------
-# Loader (CSV or Excel)
+# Loader
 # -----------------------------
 def load_table(uploaded_file) -> pd.DataFrame:
     raw_bytes = uploaded_file.read()
@@ -127,7 +126,7 @@ def load_table(uploaded_file) -> pd.DataFrame:
     return pd.read_excel(io.BytesIO(raw_bytes))
 
 # =============================
-# FTL (working)
+# FTL/TL
 # =============================
 FTL_RAW_MAP = {
     "bol": "Bill of Lading",
@@ -143,6 +142,7 @@ FTL_RAW_MAP = {
 }
 
 def build_ftl_tables(df_raw: pd.DataFrame):
+    """Returns (summary_df, data_df) where data_df includes all columns + Transit Time"""
     df = normalize_headers(df_raw).copy()
     for _, col in FTL_RAW_MAP.items():
         if col not in df.columns: df[col] = np.nan
@@ -168,7 +168,7 @@ def build_ftl_tables(df_raw: pd.DataFrame):
     cnt_tracked   = int(is_tracked_good.sum())
     grand_total   = cnt_untracked + cnt_missing + cnt_tracked
 
-    tracked_days = (delta_days.apply(lambda x: int(round_half_up_days(x)) if pd.notna(x) else np.nan)).where(is_tracked_good)
+    tracked_days = in_transit_days.where(is_tracked_good)
     avg_tracked = float(pd.to_numeric(tracked_days, errors="coerce").dropna().mean()) if cnt_tracked > 0 else ""
 
     small = pd.DataFrame({
@@ -179,6 +179,7 @@ def build_ftl_tables(df_raw: pd.DataFrame):
         "Time taken from Departure to Arrival": ["", "", "", ""],
     })
 
+    # Build main detail table
     rows = df[is_tracked_good].copy().reset_index(drop=True)
     if len(rows):
         p_city, p_state = zip(*rows[FTL_RAW_MAP["p_city_state"]].astype(str).map(split_city_state))
@@ -201,19 +202,23 @@ def build_ftl_tables(df_raw: pd.DataFrame):
         "Dropoff City": list(d_city),
         "Dropoff State": list(d_state),
         "Dropoff Country": rows[FTL_RAW_MAP["d_country"]].astype(str).str.strip(),
-        "Average of In-Transit Time": avg_days_col,
+        "Transit Time": avg_days_col,
     })
 
-    javg = float(pd.to_numeric(main["Average of In-Transit Time"], errors="coerce").dropna().mean()) if len(main) else ""
+    javg = float(pd.to_numeric(main["Transit Time"], errors="coerce").dropna().mean()) if len(main) else ""
     total_row = {col: "" for col in main.columns}
     total_row["Bill of Lading"] = "Grand Total"
-    total_row["Average of In-Transit Time"] = javg
+    total_row["Transit Time"] = javg
     main = pd.concat([main, pd.DataFrame([total_row])], ignore_index=True)
 
-    return small, main
+    # DATA sheet: all original columns + Transit Time
+    data_df = df.copy()
+    data_df["Transit Time"] = in_transit_days
+
+    return small, main, data_df
 
 # =============================
-# LTL (working)
+# LTL
 # =============================
 LTL_MAP = {
     "pro": "PRO number",
@@ -226,11 +231,10 @@ LTL_MAP = {
     "d_region": "Dropoff Country Region",
     "start_ts": "Pickup Utc Timestamp Time",
     "end_ts":   "Delivered Utc Timestamp Time",
-    "def_col_d": "Average of In-Transit Time",
-    "def_col_e": "Time taken from Picked up to Delivered",
 }
 
 def build_ltl_tables(df_raw: pd.DataFrame):
+    """Returns (summary_df, detail_df, data_df)"""
     df = normalize_headers(df_raw).copy()
     for col in [
         LTL_MAP["pro"], LTL_MAP["tracked"], LTL_MAP["p_name"], LTL_MAP["p_city_state"], LTL_MAP["p_region"],
@@ -263,8 +267,8 @@ def build_ltl_tables(df_raw: pd.DataFrame):
         "Label": ["Tracked", "Missed Milestone", "Untracked", "Grand Total"],
         "Shipment Count": [cnt_tracked, cnt_missing, cnt_untracked, grand_total],
         "": ["", "", "", ""],
-        LTL_MAP["def_col_d"]: ["", "", "", avg_tracked],
-        LTL_MAP["def_col_e"]: ["", "", "", ""],
+        "Average of In-Transit Time": ["", "", "", avg_tracked],
+        "Time taken from Picked up to Delivered": ["", "", "", ""],
     })
 
     rows = df[is_tracked_good].copy().reset_index(drop=True)
@@ -289,40 +293,23 @@ def build_ltl_tables(df_raw: pd.DataFrame):
         "Dropoff City": list(d_city),
         "Dropoff State": list(d_state),
         "Dropoff Region": rows[LTL_MAP["d_region"]].astype(str).str.strip(),
-        "Average of In-Transit Time": avg_days_col,
+        "Transit Time": avg_days_col,
     })
 
-    javg = float(pd.to_numeric(main["Average of In-Transit Time"], errors="coerce").dropna().mean()) if len(main) else ""
+    javg = float(pd.to_numeric(main["Transit Time"], errors="coerce").dropna().mean()) if len(main) else ""
     total_row = {col: "" for col in main.columns}
     total_row["Pro Number"] = "Grand Total"
-    total_row["Average of In-Transit Time"] = javg
+    total_row["Transit Time"] = javg
     main = pd.concat([main, pd.DataFrame([total_row])], ignore_index=True)
 
-    return small, main
+    # DATA sheet
+    data_df = df.copy()
+    data_df["Transit Time"] = in_transit_days
 
-# -----------------------------
-# Excel / CSV exporters
-# -----------------------------
-def build_summary_excel(small_df: pd.DataFrame, main_df: pd.DataFrame, mode_name: str) -> bytes | None:
-    engine = pick_xlsx_engine()
-    if not engine: return None
-    out = io.BytesIO()
-    with pd.ExcelWriter(out, engine=engine) as writer:
-        small_df.to_excel(writer, sheet_name="Summary", index=False, startrow=0)
-        main_df.to_excel(writer, sheet_name="Summary", index=False, startrow=6)  # row 7
-        pd.DataFrame({"Mode":[mode_name]}).to_excel(writer, sheet_name="Meta", index=False)
-    out.seek(0)
-    return out.getvalue()
-
-def build_summary_single_csv(small_df: pd.DataFrame, main_df: pd.DataFrame) -> bytes:
-    buf = io.StringIO()
-    small_df.to_csv(buf, index=False)
-    buf.write("\n")
-    main_df.to_csv(buf, index=False)
-    return buf.getvalue().encode("utf-8")
+    return small, main, data_df
 
 # =============================
-# PARCEL (working)
+# PARCEL
 # =============================
 PARCEL_MAP = {
     "shipment_id": "Shipment ID",
@@ -341,24 +328,13 @@ PARCEL_MAP = {
     "dropoff_country": "Dropoff Country",
     "destination_name": "Destination Name",
     "pickup_ts": "Pickup Utc Timestamp Time",
-    "pickup_ret_ts": "Pickup Utc Retrieval Timestamp Time",
     "departed_ts": "Departed Utc Timestamp Time",
-    "departed_ret_ts": "Departed Utc Retrieval Timestamp Time",
-    "ofd_ts": "Out for Delivery Utc Timestamp Time",
-    "ofd_ret_ts": "Out for Delivery Utc Retrieval Timestamp Time",
-    "arrived_ts": "Arrived Utc Timestamp Time",
-    "arrived_ret_ts": "Arrived Utc Retrieval Timestamp Time",
     "delivered_ts": "Delivered Utc Timestamp Time",
-    "delivered_ret_ts": "Delivered Utc Retrieval Timestamp Time",
-    "nb_expected": "Nb Milestones Expected",
-    "nb_received": "Nb Milestones Received",
-    "latency_updates_received": "Latency Updates Received",
-    "latency_updates_passed": "Latency Updates Passed",
-    "latency_in_hour": "Latency In Hour",
     "final_status_reason": "Final Status Reason",
 }
 
 def build_parcel_tables(df_raw: pd.DataFrame):
+    """Returns (summary_df, detail_df, data_df)"""
     df = normalize_headers(df_raw).copy()
     for _, col in PARCEL_MAP.items():
         if col not in df.columns: df[col] = np.nan
@@ -406,40 +382,33 @@ def build_parcel_tables(df_raw: pd.DataFrame):
         "Pickup Country": rows[PARCEL_MAP["pickup_country"]].astype(str).str.strip(),
         "Dropoff Country Region": rows[PARCEL_MAP["dropoff_region"]].astype(str).str.strip(),
         "Dropoff Country": rows[PARCEL_MAP["dropoff_country"]].astype(str).str.strip(),
-        "Average of In-Transit Time": avg_days_col,
+        "Transit Time": avg_days_col,
     })
 
-    javg = float(pd.to_numeric(main["Average of In-Transit Time"], errors="coerce").dropna().mean()) if len(main) else ""
+    javg = float(pd.to_numeric(main["Transit Time"], errors="coerce").dropna().mean()) if len(main) else ""
     total_row = {col: "" for col in main.columns}
     total_row["Tracking Number"] = "Grand Total"
-    total_row["Average of In-Transit Time"] = javg
+    total_row["Transit Time"] = javg
     main = pd.concat([main, pd.DataFrame([total_row])], ignore_index=True)
 
-    return small, main
+    # DATA sheet
+    data_df = df.copy()
+    data_df["Transit Time"] = in_transit_days
+
+    return small, main, data_df
 
 # =============================
-# OCEAN (working)
+# OCEAN
 # =============================
 OCEAN_MAP = {
     "tenant_name": "Tenant Name",
     "owner_id": "Owner ID",
     "carrier_name": "Carrier Name",
     "shipment_id": "Shipment ID",
-    "shipment_created": "Shipment Created Date Date",
-    "shipment_modified": "Shipment Modified Date Date",
-    "subscription_created": "Subscription Created Date Date",
-    "subscription_status": "Subscription Status",
-    "container_status": "Container Status",
-    "lifecycle_status": "Lifecycle Status",
     "container_number": "Container Number",
-    "container_type": "Container Type",
     "request_key": "Request Key",
-    "request_key_type": "Request Key Type",
-    "carrier_connectivity": "Carrier Connectivity",
-    "edi_source": "Edi Source",
     "pol": "Pol",
     "pod": "Pod",
-    "empty_pickup": "1-Empty Pickup Timestamp",
     "gate_in": "2-Gate In Timestamp",
     "container_loaded": "3-Container Loaded Timestamp",
     "vessel_depart_carrier": "4-Vessel Depart POL Carrier Timestamp",
@@ -448,42 +417,31 @@ OCEAN_MAP = {
     "vessel_arrive_p44": "5-Vessel Arrive POD p44 Timestamp",
     "container_discharge": "6-Container Discharge Timestamp",
     "gate_out": "7-Gate Out Timestamp",
-    "empty_return": "8-Empty Return Timestamp",
-    "origin_pickup_actual": "Origin Pickup Actual Date",
-    "delivery_actual": "Delivery Actual Date",
-    "master_shipment_id": "Master Shipment ID",
-    "duplicate_flag": "TEST-duplicate flag",
-    "missed_1": "1-Empty Pickup Missed",
-    "missed_2": "2-Gate In Missed",
-    "missed_3": "3-Container Loaded POL Missed",
-    "missed_4": "4-Vessel Departure POL Missed",
-    "missed_5": "5-Vessel Arrival POD Missed",
-    "missed_6": "6-Container Discharge POD Missed",
-    "missed_7": "7-Gate Out Missed",
-    "missed_8": "8-Empty Return Missed",
+    "lifecycle_status": "Lifecycle Status",
 }
 
 OCEAN_TS_ALL_FOR_UNTRACKED = [
-    OCEAN_MAP["gate_in"],
-    OCEAN_MAP["container_loaded"],
-    OCEAN_MAP["vessel_depart_carrier"],
-    OCEAN_MAP["vessel_depart_p44"],
-    OCEAN_MAP["vessel_arrive_carrier"],
-    OCEAN_MAP["vessel_arrive_p44"],
-    OCEAN_MAP["container_discharge"],
-    OCEAN_MAP["gate_out"],
+    "2-Gate In Timestamp",
+    "3-Container Loaded Timestamp",
+    "4-Vessel Depart POL Carrier Timestamp",
+    "4-Vessel Depart POL p44 Timestamp",
+    "5-Vessel Arrive POD Carrier Timestamp",
+    "5-Vessel Arrive POD p44 Timestamp",
+    "6-Container Discharge Timestamp",
+    "7-Gate Out Timestamp",
 ]
 
 INTERMEDIATE_TS_FOR_INTRANSIT = [
-    OCEAN_MAP["container_loaded"],
-    OCEAN_MAP["vessel_depart_carrier"],
-    OCEAN_MAP["vessel_depart_p44"],
-    OCEAN_MAP["vessel_arrive_carrier"],
-    OCEAN_MAP["vessel_arrive_p44"],
-    OCEAN_MAP["container_discharge"],
+    "3-Container Loaded Timestamp",
+    "4-Vessel Depart POL Carrier Timestamp",
+    "4-Vessel Depart POL p44 Timestamp",
+    "5-Vessel Arrive POD Carrier Timestamp",
+    "5-Vessel Arrive POD p44 Timestamp",
+    "6-Container Discharge Timestamp",
 ]
 
 def build_ocean_tables(df_raw: pd.DataFrame):
+    """Returns (summary_df, lane_detail_df, container_detail_df, data_df)"""
     df = normalize_headers(df_raw).copy()
     for _, col in OCEAN_MAP.items():
         if col not in df.columns: df[col] = np.nan
@@ -553,36 +511,36 @@ def build_ocean_tables(df_raw: pd.DataFrame):
         if cnt_tracked > 0 else pd.Series([], dtype="Int64")
     )
 
-    # Container-level (G–N)
+    # Container-level detail
     main2 = pd.DataFrame({
         "Container Number": rows_tracked[OCEAN_MAP["container_number"]].astype(str).str.strip(),
         "Request Key": rows_tracked[OCEAN_MAP["request_key"]].astype(str).str.strip(),
         "FFW Name": rows_tracked[OCEAN_MAP["carrier_name"]].astype(str).str.strip(),
         "Pol": rows_tracked[OCEAN_MAP["pol"]].astype(str).str.strip(),
         "Pod": rows_tracked[OCEAN_MAP["pod"]].astype(str).str.strip(),
-        "Average of In-Transit Time": avg_days_col,
+        "Transit Time": avg_days_col,
         "Add 7 Days D2D": 7,
         "D2D Avg Transit Time": (avg_days_col.astype("float") + 7).astype("Int64"),
     })
 
-    # Lane-level (A–E)
+    # Lane-level aggregation
     if cnt_tracked > 0 and len(rows_tracked) > 0:
         lanes = rows_tracked[[OCEAN_MAP["pol"], OCEAN_MAP["pod"]]].copy()
         lanes.columns = ["Pol", "Pod"]
-        lanes["Average of In-Transit Time"] = avg_days_col.astype("float")
+        lanes["Transit Time"] = avg_days_col.astype("float")
         lane_agg = (
-            lanes.groupby(["Pol", "Pod"], dropna=False)["Average of In-Transit Time"]
+            lanes.groupby(["Pol", "Pod"], dropna=False)["Transit Time"]
                  .mean().round().astype("Int64").reset_index()
         )
     else:
         lane_agg = pd.DataFrame({"Pol": pd.Series(dtype=str),
                                  "Pod": pd.Series(dtype=str),
-                                 "Average of In-Transit Time": pd.Series(dtype="Int64")})
+                                 "Transit Time": pd.Series(dtype="Int64")})
 
     main1 = lane_agg.copy()
     if len(main1) > 0:
         main1["Add 7 Days D2D"] = 7
-        main1["D2D Avg Transit Time"] = (pd.to_numeric(main1["Average of In-Transit Time"], errors="coerce").astype(float) + 7)\
+        main1["D2D Avg Transit Time"] = (pd.to_numeric(main1["Transit Time"], errors="coerce").astype(float) + 7)\
                                          .round().astype("Int64")
     else:
         main1["Add 7 Days D2D"] = pd.Series(dtype="Int64")
@@ -591,11 +549,11 @@ def build_ocean_tables(df_raw: pd.DataFrame):
     # Append Grand Total rows
     def _append_total_row(df_in: pd.DataFrame, first_label_col: str):
         if len(df_in) == 0: return df_in
-        javg = float(pd.to_numeric(df_in["Average of In-Transit Time"], errors="coerce").dropna().mean()) \
-               if "Average of In-Transit Time" in df_in.columns else ""
+        javg = float(pd.to_numeric(df_in["Transit Time"], errors="coerce").dropna().mean()) \
+               if "Transit Time" in df_in.columns else ""
         total = {col: "" for col in df_in.columns}
         total[first_label_col] = "Grand Total"
-        total["Average of In-Transit Time"] = javg
+        total["Transit Time"] = javg
         if "Add 7 Days D2D" in df_in.columns:
             total["Add 7 Days D2D"] = 7
             total["D2D Avg Transit Time"] = (javg + 7) if javg != "" else ""
@@ -604,19 +562,14 @@ def build_ocean_tables(df_raw: pd.DataFrame):
     main1 = _append_total_row(main1, "Pol")
     main2 = _append_total_row(main2, "Container Number")
 
-    return small, main1, main2
+    # DATA sheet
+    data_df = df.copy()
+    data_df["Transit Time"] = in_transit_days
 
-def build_ocean_single_csv(small_df: pd.DataFrame, main1_df: pd.DataFrame, main2_df: pd.DataFrame) -> bytes:
-    buf = io.StringIO()
-    small_df.to_csv(buf, index=False)
-    buf.write("\n")
-    main1_df.to_csv(buf, index=False)
-    buf.write("\n")
-    main2_df.to_csv(buf, index=False)
-    return buf.getvalue().encode("utf-8")
+    return small, main1, main2, data_df
 
 # =============================
-# AIR (fixed)
+# AIR
 # =============================
 AIR_MAP = {
     "carrier_scac": "Carrier Scac",
@@ -642,13 +595,12 @@ AIR_MAP = {
 }
 
 def build_air_tables(df_raw: pd.DataFrame):
+    """Returns (summary_df, detail_df, data_df)"""
     df = normalize_headers(df_raw).copy()
-    # Ensure columns exist
     for _, col in AIR_MAP.items():
         if col not in df.columns:
             df[col] = np.nan
 
-    # Parse timestamps (treat '0' as missing)
     m3  = df[AIR_MAP["m3_ready"]].apply(_parse_ts_zero_ok)
     m8  = df[AIR_MAP["m8_rcf"]].apply(_parse_ts_zero_ok)
     m9  = df[AIR_MAP["m9_hold"]].apply(_parse_ts_zero_ok)
@@ -656,12 +608,9 @@ def build_air_tables(df_raw: pd.DataFrame):
     m11 = df[AIR_MAP["m11_notified"]].apply(_parse_ts_zero_ok)
     m12 = df[AIR_MAP["m12_delivered"]].apply(_parse_ts_zero_ok)
 
-    # Untracked: all six empty (M3 + M8..M12)
     all_empty_six = m3.isna() & m8.isna() & m9.isna() & m10.isna() & m11.isna() & m12.isna()
     is_untracked = all_empty_six
 
-    # Pick the first available end timestamp (M12 -> M11 -> M10 -> M9 -> M8) in a way that
-    # guarantees a Pandas Series (not a NumPy array), then coerce to datetime64[ns, UTC]
     end_ts = (
         m12
         .combine_first(m11)
@@ -672,24 +621,17 @@ def build_air_tables(df_raw: pd.DataFrame):
     end_ts  = pd.to_datetime(end_ts, utc=True, errors="coerce")
     start_ts = pd.to_datetime(m3,   utc=True, errors="coerce")
 
-    # Delta (days)
     delta = end_ts - start_ts
     delta_days = delta.dt.total_seconds() / (24 * 3600)
 
-    # Cases
     delta_pos = delta_days > 0
     delta_neg = delta_days < 0
     start_missing   = start_ts.isna()
     any_end_present = ~(m8.isna() & m9.isna() & m10.isna() & m11.isna() & m12.isna())
     all_ends_missing = ~any_end_present
 
-    # Tracked: positive delta and not untracked
     is_tracked_good = delta_pos & (~is_untracked)
 
-    # Missing:
-    #  b) negative delta
-    #  c) M3 missing but any of M8..M12 present
-    #  d) M3 present but all M8..M12 missing
     is_missing = (
         delta_neg |
         (start_missing & any_end_present) |
@@ -697,11 +639,9 @@ def build_air_tables(df_raw: pd.DataFrame):
     )
     is_missing = is_missing & (~is_untracked) & (~is_tracked_good)
 
-    # Per-row rounded transit days for tracked rows
     per_row_days = delta_days.apply(lambda x: int(round_half_up_days(x)) if pd.notna(x) else np.nan)
     tracked_days = per_row_days.where(is_tracked_good)
 
-    # Counts + averages
     cnt_untracked = int(is_untracked.sum())
     cnt_missing   = int(is_missing.sum())
     cnt_tracked   = int(is_tracked_good.sum())
@@ -709,7 +649,6 @@ def build_air_tables(df_raw: pd.DataFrame):
 
     avg_tracked = float(pd.to_numeric(tracked_days, errors="coerce").dropna().mean()) if cnt_tracked > 0 else ""
 
-    # Small table (rows 1–5)
     small = pd.DataFrame({
         "Label": ["Tracked", "Untracked", "Missed Milestone", "Grand Total"],
         "Shipment Count": [cnt_tracked, cnt_untracked, cnt_missing, grand_total],
@@ -718,7 +657,6 @@ def build_air_tables(df_raw: pd.DataFrame):
         "Time taken from Ready from Carriage to Delivery": ["", "", "", ""],
     })
 
-    # Main table (tracked only) from row 7 in Excel
     rows = df[is_tracked_good].copy().reset_index(drop=True)
     avg_days_col = (
         pd.to_numeric(tracked_days[is_tracked_good], errors="coerce").astype("Int64").reset_index(drop=True)
@@ -733,182 +671,205 @@ def build_air_tables(df_raw: pd.DataFrame):
         "Pickup Country": rows[AIR_MAP["pickup_country"]].astype(str).str.strip(),
         "Destination City": rows[AIR_MAP["dest_city"]].astype(str).str.strip(),
         "Destination Country": rows[AIR_MAP["dest_country"]].astype(str).str.strip(),
-        "Average of In-Transit Time": avg_days_col,
+        "Transit Time": avg_days_col,
         "Additional days": add_days,
         "Total Transit Time": total_days_col,
     })
 
-    # Append Grand Total average row
     if len(main) > 0:
-        javg = float(pd.to_numeric(main["Average of In-Transit Time"], errors="coerce").dropna().mean())
+        javg = float(pd.to_numeric(main["Transit Time"], errors="coerce").dropna().mean())
         jtotal = javg + add_days if javg != "" else ""
     else:
         javg = ""
         jtotal = ""
     total_row = {col: "" for col in main.columns}
     total_row["Air Waybill"] = "Grand Total"
-    total_row["Average of In-Transit Time"] = javg
+    total_row["Transit Time"] = javg
     total_row["Additional days"] = add_days if javg != "" else ""
     total_row["Total Transit Time"] = jtotal
     main = pd.concat([main, pd.DataFrame([total_row])], ignore_index=True)
 
-    return small, main
+    # DATA sheet
+    data_df = df.copy()
+    data_df["Transit Time"] = per_row_days
 
+    return small, main, data_df
 
-# Single CSV for Air
-def build_air_single_csv(small_df: pd.DataFrame, main_df: pd.DataFrame) -> bytes:
-    buf = io.StringIO()
-    small_df.to_csv(buf, index=False)
-    buf.write("\n")
-    main_df.to_csv(buf, index=False)
-    return buf.getvalue().encode("utf-8")
-
-# -----------------------------
+# =============================
 # UI
-# -----------------------------
-mode = st.selectbox(
-    "Choose Product",
-    options=["FTL", "LTL", "Parcel", "Ocean", "Air"],
-    index=0,
-    help=("FTL uses original working logic; LTL uses Pickup→Delivered; "
-          "Parcel uses Departed→Delivered (0 treated as missing); "
-          "Ocean uses Gate In→Gate Out with lane/container mains; "
-          "Air uses Ready for Carriage→Delivered (fallback M11→M10→M9→M8)."),
-    key="mode_select"
-)
+# =============================
+st.markdown("### Select Modes to Process")
+col1, col2, col3, col4, col5 = st.columns(5)
 
-uploaded = st.file_uploader(
-    "Upload RAW file (CSV or Excel)",
-    type=["csv", "xlsx", "xls"],
-    accept_multiple_files=False,
-    key="uploader_main"
-)
-st.caption(f"Selected: **{mode}**")
+with col1:
+    use_ftl = st.checkbox("FTL/TL", value=False, key="cb_ftl")
+with col2:
+    use_ltl = st.checkbox("LTL", value=False, key="cb_ltl")
+with col3:
+    use_parcel = st.checkbox("Parcel", value=False, key="cb_parcel")
+with col4:
+    use_ocean = st.checkbox("Ocean", value=False, key="cb_ocean")
+with col5:
+    use_air = st.checkbox("Air", value=False, key="cb_air")
 
-if uploaded:
-    try:
-        df_raw = load_table(uploaded)
-        st.write(f"**Rows loaded:** {len(df_raw):,} | **Columns:** {len(df_raw.columns)}")
+st.markdown("---")
 
-        if mode == "FTL":
-            small_df, main_df = build_ftl_tables(df_raw)
-            st.success("Summary built successfully.")
-            with st.expander("Preview — Small table (rows 1–5)"): st.dataframe(small_df, use_container_width=True)
-            with st.expander("Preview — Main table (row 7 onward)"): st.dataframe(main_df.head(50), use_container_width=True)
-            st.download_button("⬇️ Download Summary (Single CSV)",
-                               data=build_summary_single_csv(small_df, main_df),
-                               file_name=f"Summary_{mode}.csv", mime="text/csv", use_container_width=True)
-            excel_blob = build_summary_excel(small_df, main_df, mode)
-            if excel_blob is not None:
-                st.download_button("⬇️ Download Summary (Excel)", data=excel_blob,
-                                   file_name=f"Summary_{mode}.xlsx",
-                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                   use_container_width=True)
-            st.caption(f"Counts — Tracked: {int(small_df.loc[0,'Shipment Count'])}, "
-                       f"Missed: {int(small_df.loc[1,'Shipment Count'])}, "
-                       f"Untracked: {int(small_df.loc[2,'Shipment Count'])}, "
-                       f"Total: {int(small_df.loc[3,'Shipment Count'])}")
+# File uploaders for each checked mode
+uploaded_files = {}
 
-        elif mode == "LTL":
-            small_df, main_df = build_ltl_tables(df_raw)
-            st.success("Summary built successfully.")
-            with st.expander("Preview — Small table (rows 1–5)"): st.dataframe(small_df, use_container_width=True)
-            with st.expander("Preview — Main table (row 7 onward)"): st.dataframe(main_df.head(50), use_container_width=True)
-            st.download_button("⬇️ Download Summary (Single CSV)",
-                               data=build_summary_single_csv(small_df, main_df),
-                               file_name=f"Summary_{mode}.csv", mime="text/csv", use_container_width=True)
-            excel_blob = build_summary_excel(small_df, main_df, mode)
-            if excel_blob is not None:
-                st.download_button("⬇️ Download Summary (Excel)", data=excel_blob,
-                                   file_name=f"Summary_{mode}.xlsx",
-                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                   use_container_width=True)
-            st.caption(f"Counts — Tracked: {int(small_df.loc[0,'Shipment Count'])}, "
-                       f"Missed: {int(small_df.loc[1,'Shipment Count'])}, "
-                       f"Untracked: {int(small_df.loc[2,'Shipment Count'])}, "
-                       f"Total: {int(small_df.loc[3,'Shipment Count'])}")
+if use_ftl:
+    uploaded_files["FTL"] = st.file_uploader(
+        "📁 Upload FTL/TL Data File",
+        type=["csv", "xlsx", "xls"],
+        key="uploader_ftl",
+        help="Upload the raw data file for FTL/TL mode"
+    )
 
-        elif mode == "Parcel":
-            small_df, main_df = build_parcel_tables(df_raw)
-            st.success("Summary built successfully.")
-            with st.expander("Preview — Small table (rows 1–5)"): st.dataframe(small_df, use_container_width=True)
-            with st.expander("Preview — Main table (row 7 onward)"): st.dataframe(main_df.head(50), use_container_width=True)
-            st.download_button("⬇️ Download Summary (Single CSV)",
-                               data=build_summary_single_csv(small_df, main_df),
-                               file_name=f"Summary_{mode}.csv", mime="text/csv", use_container_width=True)
-            excel_blob = build_summary_excel(small_df, main_df, mode)
-            if excel_blob is not None:
-                st.download_button("⬇️ Download Summary (Excel)", data=excel_blob,
-                                   file_name=f"Summary_{mode}.xlsx",
-                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                   use_container_width=True)
-            st.caption(f"Counts — Tracked: {int(small_df.loc[0,'Shipment Count'])}, "
-                       f"Untracked: {int(small_df.loc[1,'Shipment Count'])}, "
-                       f"Missed: {int(small_df.loc[2,'Shipment Count'])}, "
-                       f"Total: {int(small_df.loc[3,'Shipment Count'])}")
+if use_ltl:
+    uploaded_files["LTL"] = st.file_uploader(
+        "📁 Upload LTL Data File",
+        type=["csv", "xlsx", "xls"],
+        key="uploader_ltl",
+        help="Upload the raw data file for LTL mode"
+    )
 
-        elif mode == "Ocean":
-            small_df, main1_df, main2_df = build_ocean_tables(df_raw)
-            st.success("Summary built successfully.")
-            with st.expander("Preview — Small table (rows 1–5)"): st.dataframe(small_df, use_container_width=True)
-            c1, c2 = st.columns(2)
-            with c1: st.subheader("Main Table 1 — Lane Level (A8–E)"); st.dataframe(main1_df.head(50), use_container_width=True)
-            with c2: st.subheader("Main Table 2 — Container Level (G8–N)"); st.dataframe(main2_df.head(50), use_container_width=True)
+if use_parcel:
+    uploaded_files["Parcel"] = st.file_uploader(
+        "📁 Upload Parcel Data File",
+        type=["csv", "xlsx", "xls"],
+        key="uploader_parcel",
+        help="Upload the raw data file for Parcel mode"
+    )
 
-            # Single CSV (stacked)
-            st.download_button("⬇️ Download Summary (Single CSV)",
-                               data=build_ocean_single_csv(small_df, main1_df, main2_df),
-                               file_name=f"Summary_{mode}.csv", mime="text/csv", use_container_width=True)
+if use_ocean:
+    uploaded_files["Ocean"] = st.file_uploader(
+        "📁 Upload Ocean Data File",
+        type=["csv", "xlsx", "xls"],
+        key="uploader_ocean",
+        help="Upload the raw data file for Ocean mode"
+    )
 
-            # Excel: small top; mains side-by-side from row 8
-            engine = pick_xlsx_engine()
-            excel_blob = None
-            if engine:
-                out = io.BytesIO()
-                with pd.ExcelWriter(out, engine=engine) as writer:
-                    small_df.to_excel(writer, sheet_name="Summary", index=False, startrow=0, startcol=0)
-                    main1_df.to_excel(writer, sheet_name="Summary", index=False, startrow=7, startcol=0)  # A8
-                    main2_df.to_excel(writer, sheet_name="Summary", index=False, startrow=7, startcol=6)  # G8
-                    pd.DataFrame({"Mode":[mode]}).to_excel(writer, sheet_name="Meta", index=False)
-                out.seek(0)
-                excel_blob = out.getvalue()
-            if excel_blob is not None:
-                st.download_button("⬇️ Download Summary (Excel)", data=excel_blob,
-                                   file_name=f"Summary_{mode}.xlsx",
-                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                   use_container_width=True)
+if use_air:
+    uploaded_files["Air"] = st.file_uploader(
+        "📁 Upload Air Data File",
+        type=["csv", "xlsx", "xls"],
+        key="uploader_air",
+        help="Upload the raw data file for Air mode"
+    )
 
-            st.caption(f"Counts — Tracked: {int(small_df.loc[0,'Shipment Count'])}, "
-                       f"Untracked: {int(small_df.loc[1,'Shipment Count'])}, "
-                       f"Missed: {int(small_df.loc[2,'Shipment Count'])}, "
-                       f"In Transit: {int(small_df.loc[3,'Shipment Count'])}, "
-                       f"Total: {int(small_df.loc[4,'Shipment Count'])}")
+# Check if at least one mode is selected
+modes_selected = use_ftl or use_ltl or use_parcel or use_ocean or use_air
 
-        else:  # Air
-            small_df, main_df = build_air_tables(df_raw)
-            st.success("Summary built successfully.")
-            with st.expander("Preview — Small table (rows 1–5)"): st.dataframe(small_df, use_container_width=True)
-            with st.expander("Preview — Main table (row 7 onward)"): st.dataframe(main_df.head(50), use_container_width=True)
-
-            # Single CSV
-            st.download_button("⬇️ Download Summary (Single CSV)",
-                               data=build_air_single_csv(small_df, main_df),
-                               file_name=f"Summary_{mode}.csv", mime="text/csv", use_container_width=True)
-
-            # Excel (small rows 1–5, main from row 7)
-            excel_blob = build_summary_excel(small_df, main_df, mode)
-            if excel_blob is not None:
-                st.download_button("⬇️ Download Summary (Excel)", data=excel_blob,
-                                   file_name=f"Summary_{mode}.xlsx",
-                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                   use_container_width=True)
-
-            st.caption(f"Counts — Tracked: {int(small_df.loc[0,'Shipment Count'])}, "
-                       f"Untracked: {int(small_df.loc[1,'Shipment Count'])}, "
-                       f"Missed: {int(small_df.loc[2,'Shipment Count'])}, "
-                       f"Total: {int(small_df.loc[3,'Shipment Count'])}")
-
-    except Exception as e:
-        st.error(f"Could not process this file. Details: {e}")
+if not modes_selected:
+    st.info("Please select at least one mode using the checkboxes above.")
 else:
-    st.info("Upload your CSV/XLSX to generate the Summary.")
+    # Check if all selected modes have files uploaded
+    missing_files = [mode for mode, file in uploaded_files.items() if file is None]
+    
+    if missing_files:
+        st.warning(f"Please upload files for: {', '.join(missing_files)}")
+    else:
+        st.markdown("---")
+        if st.button("🚀 Generate Reports for All Selected Modes", type="primary", use_container_width=True):
+            try:
+                with st.spinner("Processing all selected modes..."):
+                    engine = pick_xlsx_engine()
+                    if not engine:
+                        st.error("Cannot export to Excel. Install xlsxwriter or openpyxl.")
+                        st.stop()
+                    
+                    out = io.BytesIO()
+                    with pd.ExcelWriter(out, engine=engine) as writer:
+                        
+                        # Process FTL
+                        if use_ftl and uploaded_files.get("FTL"):
+                            with st.status("Processing FTL/TL..."):
+                                df_raw = load_table(uploaded_files["FTL"])
+                                summary_df, detail_df, data_df = build_ftl_tables(df_raw)
+                                
+                                # Write Data sheet (all raw columns + Transit Time)
+                                data_df.to_excel(writer, sheet_name="TL Data", index=False)
+                                
+                                # Write Summary sheet (summary table + detail table)
+                                summary_df.to_excel(writer, sheet_name="TL Summary", index=False, startrow=0)
+                                detail_df.to_excel(writer, sheet_name="TL Summary", index=False, startrow=len(summary_df) + 1)
+                                
+                                st.success(f"✓ FTL/TL processed: {len(data_df):,} rows")
+                        
+                        # Process LTL
+                        if use_ltl and uploaded_files.get("LTL"):
+                            with st.status("Processing LTL..."):
+                                df_raw = load_table(uploaded_files["LTL"])
+                                summary_df, detail_df, data_df = build_ltl_tables(df_raw)
+                                
+                                data_df.to_excel(writer, sheet_name="LTL Data", index=False)
+                                summary_df.to_excel(writer, sheet_name="LTL Summary", index=False, startrow=0)
+                                detail_df.to_excel(writer, sheet_name="LTL Summary", index=False, startrow=len(summary_df) + 1)
+                                
+                                st.success(f"✓ LTL processed: {len(data_df):,} rows")
+                        
+                        # Process Parcel
+                        if use_parcel and uploaded_files.get("Parcel"):
+                            with st.status("Processing Parcel..."):
+                                df_raw = load_table(uploaded_files["Parcel"])
+                                summary_df, detail_df, data_df = build_parcel_tables(df_raw)
+                                
+                                data_df.to_excel(writer, sheet_name="Parcel Data", index=False)
+                                summary_df.to_excel(writer, sheet_name="Parcel Summary", index=False, startrow=0)
+                                detail_df.to_excel(writer, sheet_name="Parcel Summary", index=False, startrow=len(summary_df) + 1)
+                                
+                                st.success(f"✓ Parcel processed: {len(data_df):,} rows")
+                        
+                        # Process Ocean
+                        if use_ocean and uploaded_files.get("Ocean"):
+                            with st.status("Processing Ocean..."):
+                                df_raw = load_table(uploaded_files["Ocean"])
+                                summary_df, lane_df, container_df, data_df = build_ocean_tables(df_raw)
+                                
+                                data_df.to_excel(writer, sheet_name="Ocean Data", index=False)
+                                summary_df.to_excel(writer, sheet_name="Ocean Summary", index=False, startrow=0)
+                                # Lane and Container details side by side
+                                lane_df.to_excel(writer, sheet_name="Ocean Summary", index=False, startrow=len(summary_df) + 1, startcol=0)
+                                container_df.to_excel(writer, sheet_name="Ocean Summary", index=False, startrow=len(summary_df) + 1, startcol=len(lane_df.columns) + 1)
+                                
+                                st.success(f"✓ Ocean processed: {len(data_df):,} rows")
+                        
+                        # Process Air
+                        if use_air and uploaded_files.get("Air"):
+                            with st.status("Processing Air..."):
+                                df_raw = load_table(uploaded_files["Air"])
+                                summary_df, detail_df, data_df = build_air_tables(df_raw)
+                                
+                                data_df.to_excel(writer, sheet_name="Air Data", index=False)
+                                summary_df.to_excel(writer, sheet_name="Air Summary", index=False, startrow=0)
+                                detail_df.to_excel(writer, sheet_name="Air Summary", index=False, startrow=len(summary_df) + 1)
+                                
+                                st.success(f"✓ Air processed: {len(data_df):,} rows")
+                    
+                    out.seek(0)
+                    excel_data = out.getvalue()
+                    
+                    st.success("🎉 All reports generated successfully!")
+                    
+                    # Generate filename with selected modes
+                    selected_modes = []
+                    if use_ftl: selected_modes.append("TL")
+                    if use_ltl: selected_modes.append("LTL")
+                    if use_parcel: selected_modes.append("Parcel")
+                    if use_ocean: selected_modes.append("Ocean")
+                    if use_air: selected_modes.append("Air")
+                    
+                    filename = f"P44_All_Data_Modes_{'_'.join(selected_modes)}.xlsx"
+                    
+                    st.download_button(
+                        "⬇️ Download Combined Report (Excel)",
+                        data=excel_data,
+                        file_name=filename,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True
+                    )
+                    
+            except Exception as e:
+                st.error(f"Error processing files: {e}")
+                import traceback
+                st.code(traceback.format_exc())
