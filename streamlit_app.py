@@ -141,8 +141,22 @@ FTL_RAW_MAP = {
     "dropoff_arrival_utc": "Final Destination Arrival Milestone (UTC)",
 }
 
+FTL_DATA_COLUMNS = [
+    "Tenant Name", "Carrier Name", "Carrier Identifier Selection", "SCAC", "Bill of Lading", 
+    "Order Number", "Tracked", "Tracking Type", "Tracking Method", "Active Equipment ID", 
+    "Historical Equipment ID", "Pickup Name", "Pickup City State", "Pickup Country", "Pickup Region",
+    "Dropoff Name", "Dropoff City State", "Dropoff Country", "Dropoff Country Region", 
+    "Final Status Reason", "Created Timestamp Date", "Pickup Arrival Utc Timestamp Raw",
+    "Pickup Departure Utc Timestamp Raw", "Dropoff Arrival Utc Timestamp Raw", 
+    "Dropoff Departure Utc Timestamp Raw", "Transit Time", "Nb Milestones Expected",
+    "Nb Milestones Received", "Milestones Achieved Percentage", "Latency Updates Received",
+    "Latency Updates Passed", "Shipment Latency Percentage", "Average Latency (min)",
+    "Period Date", "Ping Interval (min)", "Attr1 Name", "Attr1 Value", "Attr2 Name",
+    "Attr2 Value", "Attr3 Name", "Attr3 Value", "Attr4 Name", "Attr4 Value", "Attr5 Name", "Attr5 Value"
+]
+
 def build_ftl_tables(df_raw: pd.DataFrame):
-    """Returns (summary_df, data_df) where data_df includes all columns + Transit Time"""
+    """Returns (summary_df, detail_df, data_df) where data_df has exact column structure"""
     df = normalize_headers(df_raw).copy()
     for _, col in FTL_RAW_MAP.items():
         if col not in df.columns: df[col] = np.nan
@@ -211,9 +225,15 @@ def build_ftl_tables(df_raw: pd.DataFrame):
     total_row["Transit Time"] = javg
     main = pd.concat([main, pd.DataFrame([total_row])], ignore_index=True)
 
-    # DATA sheet: all original columns + Transit Time
-    data_df = df.copy()
-    data_df["Transit Time"] = in_transit_days
+    # DATA sheet: exact column structure
+    data_df = pd.DataFrame()
+    for col in FTL_DATA_COLUMNS:
+        if col == "Transit Time":
+            data_df[col] = in_transit_days
+        elif col in df.columns:
+            data_df[col] = df[col]
+        else:
+            data_df[col] = np.nan
 
     return small, main, data_df
 
@@ -232,6 +252,22 @@ LTL_MAP = {
     "start_ts": "Pickup Utc Timestamp Time",
     "end_ts":   "Delivered Utc Timestamp Time",
 }
+
+LTL_DATA_COLUMNS = [
+    "Carrier Name", "Tenant Name", "Bill of Lading", "Bill of Lading Source", 
+    "Bill of Lading Secondary", "Bill of Lading Secondary Source", "Order Number", 
+    "PRO number", "PRO number source", "PRO number secondary", "PRO number secondary source",
+    "Purchase Order", "Purchase Order Source", "Purchase Order Secondary Source", 
+    "Purchase Order Secondary", "Pickup Number", "Customer Reference", "Tracking Number",
+    "Tracked", "Pickup City State", "Pickup Name", "Pickup Region", "Pickup Country",
+    "Destination Name", "Dropoff City State", "Dropoff Country Region", "Dropoff Country",
+    "Pickup Utc Timestamp Time", "Pickup Utc Retrieval Timestamp Time", 
+    "Out for Delivery Utc Timestamp Time", "Out for Delivery Utc Retrieval Timestamp Time",
+    "Delivered Utc Timestamp Time", "Delivered Utc Retrieval Timestamp Time", "Transit Time",
+    "Has All Milestones (Yes / No)", "Nb Milestones Expected", "Nb Milestones Received",
+    "Latency Updates Received", "Latency Updates Passed", "Average Latency (hour)", 
+    "Final Status Reason"
+]
 
 def build_ltl_tables(df_raw: pd.DataFrame):
     """Returns (summary_df, detail_df, data_df)"""
@@ -302,9 +338,15 @@ def build_ltl_tables(df_raw: pd.DataFrame):
     total_row["Transit Time"] = javg
     main = pd.concat([main, pd.DataFrame([total_row])], ignore_index=True)
 
-    # DATA sheet
-    data_df = df.copy()
-    data_df["Transit Time"] = in_transit_days
+    # DATA sheet: exact column structure
+    data_df = pd.DataFrame()
+    for col in LTL_DATA_COLUMNS:
+        if col == "Transit Time":
+            data_df[col] = in_transit_days
+        elif col in df.columns:
+            data_df[col] = df[col]
+        else:
+            data_df[col] = np.nan
 
     return small, main, data_df
 
@@ -332,6 +374,14 @@ PARCEL_MAP = {
     "delivered_ts": "Delivered Utc Timestamp Time",
     "final_status_reason": "Final Status Reason",
 }
+
+PARCEL_DATA_COLUMNS = [
+    "Carrier Name", "Tracking Number", "Tracked", "Pickup Region", "Pickup Country",
+    "Dropoff Country Region", "Dropoff Country", "Pickup Utc Timestamp Time",
+    "Departed Utc Timestamp Time", "Out for Delivery Utc Timestamp Time",
+    "Arrived Utc Timestamp Time", "Delivered Utc Timestamp Time", "Transit Time",
+    "Final Status Reason"
+]
 
 def build_parcel_tables(df_raw: pd.DataFrame):
     """Returns (summary_df, detail_df, data_df)"""
@@ -391,9 +441,15 @@ def build_parcel_tables(df_raw: pd.DataFrame):
     total_row["Transit Time"] = javg
     main = pd.concat([main, pd.DataFrame([total_row])], ignore_index=True)
 
-    # DATA sheet
-    data_df = df.copy()
-    data_df["Transit Time"] = in_transit_days
+    # DATA sheet: exact column structure
+    data_df = pd.DataFrame()
+    for col in PARCEL_DATA_COLUMNS:
+        if col == "Transit Time":
+            data_df[col] = in_transit_days
+        elif col in df.columns:
+            data_df[col] = df[col]
+        else:
+            data_df[col] = np.nan
 
     return small, main, data_df
 
@@ -419,6 +475,21 @@ OCEAN_MAP = {
     "gate_out": "7-Gate Out Timestamp",
     "lifecycle_status": "Lifecycle Status",
 }
+
+OCEAN_DATA_COLUMNS = [
+    "Shipper Tenant Name", "Owner ID", "Carrier Name", "Shipment ID", 
+    "Tracking Requested Date Date", "Subscription Created Date Date", "Subscription Status",
+    "Container Status", "Lifecycle Status", "Container Number", "Request Key", "FFW Name",
+    "Request Key Type", "Carrier Connectivity", "Edi Source", "POL", "POD",
+    "1-Empty Pickup Timestamp", "2-Gate In Timestamp", "3-Container Loaded Timestamp",
+    "4-Vessel Depart POL Carrier Timestamp", "4-Vessel Depart POL p44 Timestamp",
+    "5-Vessel Arrive POD Carrier Timestamp", "5-Vessel Arrive POD p44 Timestamp",
+    "6-Container Discharge Timestamp", "7-Gate Out Timestamp", "8-Empty Return Timestamp",
+    "Transit Time", "Shipment Completed", "1-Empty Pickup Missed", "2-Gate In Missed",
+    "3-Container Loaded POL Missed", "4-Vessel Departure POL Missed", 
+    "5-Vessel Arrival POD Missed", "6-Container Discharge POD Missed", 
+    "7-Gate Out Missed", "8-Empty Return Missed"
+]
 
 OCEAN_TS_ALL_FOR_UNTRACKED = [
     "2-Gate In Timestamp",
@@ -562,9 +633,19 @@ def build_ocean_tables(df_raw: pd.DataFrame):
     main1 = _append_total_row(main1, "Pol")
     main2 = _append_total_row(main2, "Container Number")
 
-    # DATA sheet
-    data_df = df.copy()
-    data_df["Transit Time"] = in_transit_days
+    # DATA sheet: exact column structure (with POL/POD mapped correctly)
+    data_df = pd.DataFrame()
+    for col in OCEAN_DATA_COLUMNS:
+        if col == "Transit Time":
+            data_df[col] = in_transit_days
+        elif col == "POL" and OCEAN_MAP["pol"] in df.columns:
+            data_df[col] = df[OCEAN_MAP["pol"]]
+        elif col == "POD" and OCEAN_MAP["pod"] in df.columns:
+            data_df[col] = df[OCEAN_MAP["pod"]]
+        elif col in df.columns:
+            data_df[col] = df[col]
+        else:
+            data_df[col] = np.nan
 
     return small, main1, main2, data_df
 
@@ -593,6 +674,16 @@ AIR_MAP = {
     "m11_notified": "M11 Notified Utc Dt",
     "m12_delivered": "M12 Delivered Utc Dt",
 }
+
+AIR_DATA_COLUMNS = [
+    "Airline Code", "Airline Name", "Tracking Type", "Air Waybill", "FFW Name",
+    "Pickup Country", "Pickup City", "Destination Country", "Destination City",
+    "Shipment Created Date", "M3 Ready for Carriage Utc Dt",
+    "M8 Received Cargo From Flight Utc Dt", "M10 Import Custom Cleared Utc Dt",
+    "M11 Notified Utc Dt", "M12 Delivered Utc Dt", "Transit Time", "",
+    "M8 Received Cargo From Flight Utc Dt.1", "M10 Import Custom Cleared Utc Dt.1",
+    "M11 Notified Utc Dt.1", "M12 Delivered Utc Dt.1", "In-Transit Time"
+]
 
 def build_air_tables(df_raw: pd.DataFrame):
     """Returns (summary_df, detail_df, data_df)"""
@@ -689,9 +780,29 @@ def build_air_tables(df_raw: pd.DataFrame):
     total_row["Total Transit Time"] = jtotal
     main = pd.concat([main, pd.DataFrame([total_row])], ignore_index=True)
 
-    # DATA sheet
-    data_df = df.copy()
-    data_df["Transit Time"] = per_row_days
+    # DATA sheet: exact column structure
+    # Create "In-Transit Time" - can be text like "Missed Milestones" or numeric days
+    in_transit_time_col = pd.Series(index=df.index, dtype=object)
+    for idx in df.index:
+        if is_tracked_good.iloc[idx]:
+            in_transit_time_col.iloc[idx] = per_row_days.iloc[idx]
+        elif is_missing.iloc[idx]:
+            in_transit_time_col.iloc[idx] = "Missed Milestones"
+        else:
+            in_transit_time_col.iloc[idx] = np.nan
+
+    data_df = pd.DataFrame()
+    for col in AIR_DATA_COLUMNS:
+        if col == "Transit Time":
+            data_df[col] = per_row_days
+        elif col == "In-Transit Time":
+            data_df[col] = in_transit_time_col
+        elif col == "":
+            data_df[col] = ""
+        elif col in df.columns:
+            data_df[col] = df[col]
+        else:
+            data_df[col] = np.nan
 
     return small, main, data_df
 
